@@ -4,9 +4,11 @@
 param(
   [switch]$TimeStamp,
   [switch]$FullCheck,
-  [string]$OutputDir = '.\BlueWinPEAS_Output',
+  [string]$OutputDir = '.\WinHostPEAS_Output',
   [switch]$NoReport,
-  [switch]$NoLaunch
+  [switch]$NoLaunch,
+  [switch]$Obfuscate,
+  [string]$EncryptKey
 )
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -78,12 +80,19 @@ function Write-Reports {
   if ($NoReport) { return }
   try { New-Item -ItemType Directory -Path $Dir -Force | Out-Null } catch { Write-Host "Cannot create report dir: $_" -ForegroundColor Red; return }
   $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $json = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.json" -f $env:COMPUTERNAME, $stamp)
-  $csv  = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.csv"  -f $env:COMPUTERNAME, $stamp)
-  $html = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.html" -f $env:COMPUTERNAME, $stamp)
+  if ($Obfuscate) {
+    $rid = -join ((1..12) | ForEach-Object { [char](Get-Random -Min 97 -Max 122) })
+    $baseName = "rpt_{0}_{1}" -f $rid, $stamp
+  } else {
+    $baseName = "WinHostPEAS_{0}_{1}" -f $env:COMPUTERNAME, $stamp
+  }
+  $json = Join-Path $Dir ("{0}.json" -f $baseName)
+  $csv  = Join-Path $Dir ("{0}.csv"  -f $baseName)
+  $html = Join-Path $Dir ("{0}.html" -f $baseName)
 
+  $toolLabel = if ($Obfuscate) { 'Posture Audit' } else { 'WinHostPEAS (defensive refit of winPEAS.ps1)' }
   $meta = [pscustomobject]@{
-    Tool        = 'BlueWinPEAS (defensive refit of winPEAS.ps1)'
+    Tool        = $toolLabel
     Host        = $env:COMPUTERNAME
     Generated   = (Get-Date).ToString('s')
     Duration    = $stopwatch.Elapsed.ToString('mm\:ss')
@@ -112,22 +121,22 @@ function Write-Reports {
   $catOpts = foreach ($c in $cats) { '<option value="' + $c.Name + '">' + $c.Name + ' (' + $c.Count + ')</option>' }
 
   $rowsJs = foreach ($f in $script:Findings) {
-    $esc = { param($t) if ($null -eq $t) { '' } else { $t.ToString().Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", ' ') } }
+    $esc = { param($t) if ($null -eq $t) { '' } else { $t.ToString().Replace('\', '\\').Replace('"', '\"').Replace('<', ([char]0x5c + 'u003c')).Replace('>', ([char]0x5c + 'u003e')).Replace("`r", '').Replace("`n", ' ') } }
     '  { sev: "' + $f.Severity + '", cat: "' + (& $esc $f.Category) + '", title: "' + (& $esc $f.Title) + '", detail: "' + (& $esc $f.Detail) + '", evid: "' + (& $esc $f.Evidence) + '", rem: "' + (& $esc $f.Remediation) + '" },'
   }
 
-  $adminList = if ($script:Exec.Admins) { $script:Exec.Admins -join ', ' } else { '(none resolved)' }
+  $adminList = if ($script:Exec.Admins) { (($script:Exec.Admins | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) }) -join ', ') } else { '(none resolved)' }
   $userRows = foreach ($u in $script:Exec.Users) {
     $ll = if ($u.LastLogon) { $u.LastLogon.ToString('yyyy-MM-dd HH:mm') } else { '<span class="never">never</span>' }
     $adm = if ($u.IsAdmin) { '<b class="adm">ADMIN</b>' } else { '' }
     $en = if ($u.Enabled) { 'enabled' } else { '<span class="dis">disabled</span>' }
-    '<tr><td>' + $u.Name + '</td><td>' + $en + '</td><td>' + $adm + '</td><td>' + $ll + '</td></tr>'
+    '<tr><td>' + [System.Net.WebUtility]::HtmlEncode([string]$u.Name) + '</td><td>' + $en + '</td><td>' + $adm + '</td><td>' + $ll + '</td></tr>'
   }
   $userRows = @('<tr><th>User</th><th>Status</th><th>Role</th><th>Last logon</th></tr>') + @($userRows)
 
   $htmlDoc = @"
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
+<title>WinHostPEAS Report - $($env:COMPUTERNAME)</title>
 <style>
  body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f1f5f9;color:#111827}
  header{background:#0f172a;color:#fff;padding:18px 28px}
@@ -167,7 +176,7 @@ function Write-Reports {
  .dis{color:#94a3b8}
 </style></head><body>
 <header>
- <h1>BlueWinPEAS Posture Audit &mdash; $($env:COMPUTERNAME)</h1>
+ <h1>$(if ($Obfuscate) { "Posture Audit" } else { "WinHostPEAS Posture Audit" }) &mdash; $($env:COMPUTERNAME)</h1>
  <div class="meta">Generated $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; $($meta.TotalFindings) findings &middot; highest severity: $($meta.HighestSeverity) &middot; FullCheck: $($meta.FullCheck)</div>
 </header>
 <div class="bar">
@@ -190,7 +199,7 @@ function Write-Reports {
     <tr><td>Hardening gaps (Crit/High/Med)</td><td><b>$($script:Exec.HardeningGaps)</b></td></tr>
     <tr><td>Exposed secrets (Crit/High)</td><td><b>$($script:Exec.SecretsExposed)</b></td></tr>
     <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (passive ARP/neighbor cache - no packets sent)</td></tr>
-    <tr><td>Scan mode</td><td>Fully passive - local checks and network visibility read local state only, no packets sent to other hosts</td></tr>
+    <tr><td>Scan mode</td><td>Fully passive host recon - every check reads local state only (registry, WMI, local socket tables, local files). No network packets are sent to any host, including domain controllers.</td></tr>
    </table>
   </div>
   <div class="exec-card">
@@ -243,7 +252,31 @@ render();
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
 
-  if ($LaunchHtml -and -not $NoLaunch) {
+  if ($EncryptKey -and $EncryptKey.Length -ge 8) {
+    try {
+      Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+      $salt = [byte[]](1..16)
+      $kdb = [System.Text.Encoding]::UTF8.GetBytes($EncryptKey.PadRight(32).Substring(0, 32))
+      $aes = [System.Security.Cryptography.Aes]::Create()
+      $aes.Key = $kdb
+      $aes.IV = $salt
+      $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+      foreach ($f in @($json, $csv, $html)) {
+        if (-not (Test-Path $f)) { continue }
+        $raw = [System.IO.File]::ReadAllBytes($f)
+        $enc = $aes.CreateEncryptor().TransformFinalBlock($raw, 0, $raw.Length)
+        [System.IO.File]::WriteAllBytes($f + '.enc', $enc)
+        Remove-Item $f -Force
+        Write-Host ('Encrypted: ' + $f + '.enc') -ForegroundColor DarkCyan
+      }
+      Write-Host 'Reports AES-encrypted. Decrypt with the same key + IV 01-16.' -ForegroundColor DarkCyan
+    }
+    catch {
+      Write-Host ('Encryption failed: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
+  }
+
+  if ($LaunchHtml -and -not $NoLaunch -and -not $EncryptKey) {
     try {
       $resolved = (Resolve-Path $html).Path
       Start-Process $resolved
@@ -253,24 +286,6 @@ render();
       Write-Host ('Could not launch browser automatically - open manually: ' + $html) -ForegroundColor Yellow
     }
   }
-}
-
-function Convert-SidToName {
-  param($SidInput)
-  if ($null -eq $SidInput) { return $null }
-  try {
-    if ($SidInput -is [System.Security.Principal.SecurityIdentifier]) { $sidObject = $SidInput }
-    else { $sidObject = New-Object System.Security.Principal.SecurityIdentifier($SidInput) }
-    return $sidObject.Translate([System.Security.Principal.NTAccount]).Value
-  }
-  catch {
-    try { return $sidObject.Value } catch { return [string]$SidInput }
-  }
-}
-
-function Get-DomainContext {
-  try { return [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain() }
-  catch { return $null }
 }
 
 function Start-ACLCheck {
@@ -283,17 +298,17 @@ function Start-ACLCheck {
     whoami.exe /groups /fo csv 2>$null | Select-Object -skip 2 | ConvertFrom-Csv -Header 'group name' |
       Select-Object -ExpandProperty 'group name' | ForEach-Object { $Identity += $_ }
   } catch { }
-  $currentUser = "$env:COMPUTERNAME\$env:USERNAME"
   $everyoneLike = @('Everyone', 'BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'BUILTIN\Authenticated Users')
   foreach ($i in $Identity) {
     $permission = $ACLObject.Access | Where-Object { $_.IdentityReference -like $i }
+
+    $fsr = "$($permission.FileSystemRights)"
+    $rr = "$($permission.RegistryRights)"
     $userPermission = ''
-    switch -WildCard ("$($Permission.FileSystemRights)") {
-      'FullControl' { $userPermission = 'FullControl' }
-      'Write*'      { $userPermission = 'Write' }
-      'Modify'      { $userPermission = 'Modify' }
-    }
-    if ("$($Permission.RegistryRights)" -eq 'FullControl') { $userPermission = 'FullControl' }
+    if ($fsr -match 'FullControl') { $userPermission = 'FullControl' }
+    elseif ($fsr -match 'Modify') { $userPermission = 'Modify' }
+    elseif ($fsr -match 'Write') { $userPermission = 'Write' }
+    if ($rr -match 'FullControl') { $userPermission = 'FullControl' }
     if ($userPermission) {
       if ($Target -like "*$env:USERNAME*") { continue }
       Add-Finding -Severity High -Category 'Filesystem ACL' `
@@ -319,205 +334,28 @@ function Start-ACLCheck {
 }
 
 function Get-InstalledApplications {
-  [cmdletbinding()]
-  param([Parameter(DontShow)]$keys = @('', '\Wow6432Node'))
-  foreach ($key in $keys) {
-    try {
-      $apps = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $env:COMPUTERNAME).OpenSubKey("SOFTWARE$key\Microsoft\Windows\CurrentVersion\Uninstall").GetSubKeyNames()
-    }
-    catch { continue }
-    foreach ($app in $apps) {
-      $program = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $env:COMPUTERNAME).OpenSubKey("SOFTWARE$key\Microsoft\Windows\CurrentVersion\Uninstall\$app")
-      $name = $program.GetValue('DisplayName')
-      if ($name) {
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+  )
+  foreach ($root in $roots) {
+    if (-not (Test-Path $root)) { continue }
+    $arch = if ($root -match 'Wow6432Node') { 'x86' } else { 'x64' }
+    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+      $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+      if ($props -and $props.DisplayName) {
         [pscustomobject]@{
           Computername = $env:COMPUTERNAME
-          Software     = $name
-          Version      = $program.GetValue('DisplayVersion')
-          Publisher    = $program.GetValue('Publisher')
-          InstallDate  = $program.GetValue('InstallDate')
-          Architecture = $(if ($key -eq '\wow6432node') { 'x86' } else { 'x64' })
+          Software     = $props.DisplayName
+          Version      = $props.DisplayVersion
+          Publisher    = $props.Publisher
+          InstallDate  = $props.InstallDate
+          Architecture = $arch
         }
       }
     }
   }
-}
-function Get-DomainContext {
-  try {
-    return [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
-  }
-  catch {
-    return $null
-  }
-}
-
-function Convert-SidToName {
-  param(
-    $SidInput
-  )
-  if ($null -eq $SidInput) { return $null }
-  try {
-    if ($SidInput -is [System.Security.Principal.SecurityIdentifier]) {
-      $sidObject = $SidInput
-    }
-    else {
-      $sidObject = New-Object System.Security.Principal.SecurityIdentifier($SidInput)
-    }
-    return $sidObject.Translate([System.Security.Principal.NTAccount]).Value
-  }
-  catch {
-    try { return $sidObject.Value }
-    catch { return [string]$SidInput }
-  }
-}
-
-function Get-WeakDnsUpdateFindings {
-  param(
-    [System.DirectoryServices.ActiveDirectory.Domain]$DomainContext
-  )
-  if (-not $DomainContext) { return @() }
-  $domainDN = $DomainContext.GetDirectoryEntry().distinguishedName
-  $forestDN = $DomainContext.Forest.RootDomain.GetDirectoryEntry().distinguishedName
-  $paths = @(
-    "LDAP://CN=MicrosoftDNS,DC=DomainDnsZones,$domainDN",
-    "LDAP://CN=MicrosoftDNS,DC=ForestDnsZones,$forestDN",
-    "LDAP://CN=MicrosoftDNS,$domainDN"
-  )
-  $weakPatterns = @(
-    "authenticated users",
-    "everyone",
-    "domain users"
-  )
-  $dangerousRights = @("GenericAll", "GenericWrite", "CreateChild", "WriteProperty", "WriteDacl", "WriteOwner")
-  $findings = @()
-  foreach ($path in $paths) {
-    try {
-      $container = New-Object System.DirectoryServices.DirectoryEntry($path)
-      $null = $container.NativeGuid
-    }
-    catch { continue }
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher($container)
-    $searcher.Filter = "(objectClass=dnsZone)"
-    $searcher.PageSize = 500
-    $results = $searcher.FindAll()
-    foreach ($result in $results) {
-      try {
-        $zoneEntry = $result.GetDirectoryEntry()
-        $zoneEntry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-        $sd = $zoneEntry.ObjectSecurity
-        foreach ($ace in $sd.Access) {
-          if ($ace.AccessControlType -ne 'Allow') { continue }
-          $principal = Convert-SidToName $ace.IdentityReference
-          if (-not $principal) { continue }
-          $principalLower = $principal.ToLower()
-          if (-not ($weakPatterns | Where-Object { $principalLower -like "*${_}*" })) { continue }
-          $rights = $ace.ActiveDirectoryRights.ToString()
-          if (-not ($dangerousRights | Where-Object { $rights -like "*${_}*" })) { continue }
-          $findings += [pscustomobject]@{
-            Zone      = $zoneEntry.Properties["name"].Value
-            Partition = $path.Split(',')[1]
-            Principal = $principal
-            Rights    = $rights
-          }
-        }
-      }
-      catch { continue }
-    }
-  }
-  return ($findings | Sort-Object Zone, Principal -Unique)
-}
-
-function Get-GmsaReadersReport {
-  param(
-    [System.DirectoryServices.ActiveDirectory.Domain]$DomainContext
-  )
-  if (-not $DomainContext) { return @() }
-  $domainDN = $DomainContext.GetDirectoryEntry().distinguishedName
-  try {
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher
-    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDN")
-    $searcher.Filter = "(&(objectClass=msDS-GroupManagedServiceAccount))"
-    $searcher.PageSize = 500
-    [void]$searcher.PropertiesToLoad.Add("sAMAccountName")
-    [void]$searcher.PropertiesToLoad.Add("msDS-GroupMSAMembership")
-    $results = $searcher.FindAll()
-  }
-  catch { return @() }
-  $report = @()
-  foreach ($result in $results) {
-    $name = $result.Properties["samaccountname"]
-    $blobs = $result.Properties["msds-groupmsamembership"]
-    if (-not $blobs) { continue }
-    $principals = @()
-    foreach ($blob in $blobs) {
-      try {
-        $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor (, $blob)
-        foreach ($ace in $raw.DiscretionaryAcl) {
-          $sid = Convert-SidToName $ace.SecurityIdentifier
-          if ($sid) { $principals += $sid }
-        }
-      }
-      catch { continue }
-    }
-    if ($principals.Count -eq 0) { continue }
-    $principals = $principals | Sort-Object -Unique
-    $weak = $principals | Where-Object { $_ -match 'Domain Users|Authenticated Users|Everyone' }
-    $report += [pscustomobject]@{
-      Account        = ($name | Select-Object -First 1)
-      Allowed        = ($principals -join ", ")
-      WeakPrincipals = if ($weak) { $weak -join ", " } else { "" }
-    }
-  }
-  return $report
-}
-
-function Get-PrivilegedSpnTargets {
-  param(
-    [System.DirectoryServices.ActiveDirectory.Domain]$DomainContext
-  )
-  if (-not $DomainContext) { return @() }
-  $domainDN = $DomainContext.GetDirectoryEntry().distinguishedName
-  $keywords = @(
-    "Domain Admin",
-    "Enterprise Admin",
-    "Administrators",
-    "Exchange",
-    "IT_",
-    "Schema Admin",
-    "Account Operator",
-    "Server Operator",
-    "Backup Operator",
-    "DnsAdmin"
-  )
-  try {
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher
-    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDN")
-    $searcher.Filter = "(&(objectClass=user)(servicePrincipalName=*))"
-    $searcher.PageSize = 500
-    [void]$searcher.PropertiesToLoad.Add("sAMAccountName")
-    [void]$searcher.PropertiesToLoad.Add("memberOf")
-    $results = $searcher.FindAll()
-  }
-  catch { return @() }
-  $findings = @()
-  foreach ($res in $results) {
-    $groups = $res.Properties["memberof"]
-    if (-not $groups) { continue }
-    $matchedGroups = @()
-    foreach ($group in $groups) {
-      $cn = ($group -split ',')[0] -replace '^CN=',''
-      if ($keywords | Where-Object { $cn -like "*${_}*" }) {
-        $matchedGroups += $cn
-      }
-    }
-    if ($matchedGroups.Count -gt 0) {
-      $findings += [pscustomobject]@{
-        User   = ($res.Properties["samaccountname"] | Select-Object -First 1)
-        Groups = ($matchedGroups | Sort-Object -Unique) -join ', '
-      }
-    }
-  }
-  return ($findings | Sort-Object User | Select-Object -First 12)
 }
 
 function Get-NtlmPolicySummary {
@@ -530,35 +368,6 @@ function Get-NtlmPolicySummary {
     RestrictReceiving = $msv.RestrictReceivingNTLMTraffic
     RestrictSending   = $msv.RestrictSendingNTLMTraffic
     LmCompatibility   = if ($lsa) { $lsa.LmCompatibilityLevel } else { $null }
-  }
-}
-
-function Get-TimeSkewInfo {
-  param(
-    [System.DirectoryServices.ActiveDirectory.Domain]$DomainContext
-  )
-  if (-not $DomainContext) { return $null }
-  try {
-    $pdc = $DomainContext.PdcRoleOwner.Name
-  }
-  catch { return $null }
-  try {
-    $stripchart = w32tm /stripchart /computer:$pdc /dataonly /samples:3 2>$null
-    $sample = $stripchart | Where-Object { $_ -match ',' } | Select-Object -Last 1
-    if (-not $sample) { return $null }
-    $parts = $sample.Split(',')
-    if ($parts.Count -lt 2) { return $null }
-    $offsetString = $parts[1].Trim().TrimEnd('s')
-    [double]$offsetSeconds = 0
-    if (-not [double]::TryParse($offsetString, [ref]$offsetSeconds)) { return $null }
-    return [pscustomobject]@{
-      Source        = $pdc
-      OffsetSeconds = $offsetSeconds
-      RawSample     = $sample
-    }
-  }
-  catch {
-    return $null
   }
 }
 
@@ -657,6 +466,25 @@ function Test-FileForSecrets {
   }
 }
 
+$script:IsElevated = $false
+try {
+  $script:IsElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+$script:ElevGated = 'audit policy, secedit password/lockout baseline, bcdedit test-signing/code-integrity, Security event-log size, BitLocker status, WMI permanent-subscription enumeration, NetworkList connectivity history, IIS applicationHost deep config, and other users'' RDP/process history'
+Write-Host ''
+if ($script:IsElevated) {
+  Write-Host '[+] Running ELEVATED - full check coverage.' -ForegroundColor Green
+}
+else {
+  Write-Host '[!] Running NON-ELEVATED - some checks are limited or skipped.' -ForegroundColor Yellow
+  Write-Host ('    Elevation-gated: ' + $script:ElevGated) -ForegroundColor DarkYellow
+  Write-Host '    Re-run from an elevated prompt for a complete audit.' -ForegroundColor DarkYellow
+}
+Add-Finding -Severity $(if ($script:IsElevated) { 'Info' } else { 'Low' }) -Category 'Scan' `
+  -Title $(if ($script:IsElevated) { 'Scan ran elevated (full coverage)' } else { 'Scan ran NON-elevated (partial coverage)' }) `
+  -Detail $(if ($script:IsElevated) { 'Administrator context - all checks attempted.' } else { 'Standard-user context. These checks were limited or skipped: ' + $script:ElevGated + '.' }) `
+  -Remediation $(if ($script:IsElevated) { 'None.' } else { 'Re-run from an elevated PowerShell prompt for complete, trustworthy results.' })
+
 Start-Section 'SYSTEM INFORMATION'
 $os = Get-CimInstance Win32_OperatingSystem
 Add-Finding -Severity Info -Category 'System' -Title 'OS baseline' `
@@ -721,10 +549,19 @@ try {
     $excl += $prefs.ExclusionProcess
     $excl += $prefs.ExclusionExtension
   }
+
+  $exclPartial = -not $script:IsElevated
   if ($excl.Count -gt 0) {
-    Add-Finding -Severity High -Category 'AV' -Title ('Defender exclusions configured ({0})' -f $excl.Count) `
-      -Detail ('Exclusions: ' + (($excl | Where-Object { $_ }) -join ' | ')) `
+    $suffix = if ($exclPartial) { ' - PARTIAL, needs elevation' } else { '' }
+    $warn = if ($exclPartial) { ' || WARNING: this list is incomplete - a non-elevated caller sees only a subset. Re-run elevated for the true count.' } else { '' }
+    Add-Finding -Severity High -Category 'AV' -Title ('Defender exclusions configured ({0}{1})' -f $excl.Count, $suffix) `
+      -Detail ('Exclusions: ' + (($excl | Where-Object { $_ }) -join ' | ') + $warn) `
       -Remediation 'Review every exclusion for necessity; attackers commonly add their tool paths here. Remove any that are not documented.'
+  }
+  elseif ($exclPartial) {
+    Add-Finding -Severity Info -Category 'AV' -Title 'Defender exclusions not assessed (needs elevation)' `
+      -Detail 'Get-MpPreference returned no exclusions, but a non-elevated caller cannot see the full list. Absence here is not evidence that none are configured.' `
+      -Remediation 'Re-run elevated to enumerate Defender exclusions.'
   }
 }
 catch {
@@ -732,18 +569,29 @@ catch {
 }
 
 Start-Section 'AUDITING & LOGGING POSTURE'
-try {
-  $auditPolicy = (auditpol.exe /get /category:* 2>$null | Where-Object { $_ -match '^\s' })
-  $lapse = $auditPolicy | Where-Object { $_ -match 'Logon/Logoff|Privilege Use|Object Access' -and $_ -match 'No Auditing' }
-  if ($lapse) {
-    Add-Finding -Severity Medium -Category 'Logging' -Title 'Critical audit subcategories set to No Auditing' `
-      -Detail (($lapse | ForEach-Object { $_.Trim() }) -join ' ; ') `
-      -Remediation 'Enable auditing for Logon/Logoff and Privilege Use (advanced audit policy: AuditLogon, AuditPrivilegeUse).'
-  }
-  else {
-    Add-Finding -Severity Info -Category 'Logging' -Title 'Core audit categories enabled'
-  }
-} catch { }
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'Logging' -Title 'Audit policy not assessed (needs elevation)' `
+    -Detail 'auditpol /get requires administrator; run elevated to verify Logon/Logoff, Privilege Use and Object Access auditing.'
+}
+else {
+  try {
+    $auditPolicy = (auditpol.exe /get /category:* 2>$null | Where-Object { $_ -match '^\s' })
+    if (-not $auditPolicy) {
+      Add-Finding -Severity Info -Category 'Logging' -Title 'Audit policy unreadable' -Detail 'auditpol returned no data even when elevated.'
+    }
+    else {
+      $lapse = $auditPolicy | Where-Object { $_ -match 'Logon/Logoff|Privilege Use|Object Access' -and $_ -match 'No Auditing' }
+      if ($lapse) {
+        Add-Finding -Severity Medium -Category 'Logging' -Title 'Critical audit subcategories set to No Auditing' `
+          -Detail (($lapse | ForEach-Object { $_.Trim() }) -join ' ; ') `
+          -Remediation 'Enable auditing for Logon/Logoff and Privilege Use (advanced audit policy: AuditLogon, AuditPrivilegeUse).'
+      }
+      else {
+        Add-Finding -Severity Info -Category 'Logging' -Title 'Core audit categories enabled'
+      }
+    }
+  } catch { }
+}
 
 try {
   $secLog = Get-WinEvent -ListLog Security -ErrorAction Stop
@@ -755,7 +603,13 @@ try {
   else {
     Add-Finding -Severity Info -Category 'Logging' -Title "Security event log size ${mb} MB"
   }
-} catch { }
+}
+catch {
+  if (-not $script:IsElevated) {
+    Add-Finding -Severity Info -Category 'Logging' -Title 'Security event log not assessed (needs elevation)' `
+      -Detail 'Reading the Security log configuration requires administrator; run elevated to check its size/retention.'
+  }
+}
 
 if (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager') {
   Add-Finding -Severity Info -Category 'Logging' -Title 'Windows Event Forwarding configured'
@@ -1045,13 +899,36 @@ foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBacku
   }
 }
 
-$enableLUA = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue).EnableLUA
-if ($enableLUA -ne 1) {
-  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC disabled (EnableLUA != 1)' `
-    -Remediation 'Set EnableLUA=1; UAC off means every process runs unprompted at full elevation rights.'
+$uacKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+$uacProps = Get-ItemProperty $uacKey -ErrorAction SilentlyContinue
+$hasLUA = $uacProps -and ($uacProps.PSObject.Properties.Name -contains 'EnableLUA')
+$enableLUA = $uacProps.EnableLUA
+if (-not $hasLUA) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC EnableLUA value is absent from the registry' `
+    -Detail ('{0} has no EnableLUA value. Windows ships with it set to 1, so its absence means it was removed. Confirm behaviourally: if an elevation request succeeds with no consent prompt, UAC is not protecting this host.' -f $uacKey) `
+    -Evidence $uacKey `
+    -Remediation 'Recreate EnableLUA (DWORD) = 1 and reboot, then investigate what removed it.'
+}
+elseif ($enableLUA -ne 1) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title ('UAC disabled (EnableLUA = {0})' -f $enableLUA) `
+    -Detail 'Every process launched by an administrator runs fully elevated with no consent prompt.' `
+    -Remediation 'Set EnableLUA=1 and reboot.'
 }
 else {
-  Add-Finding -Severity Info -Category 'PrivEsc' -Title 'UAC enabled'
+  Add-Finding -Severity Info -Category 'PrivEsc' -Title 'UAC enabled (EnableLUA = 1)'
+}
+
+if ($uacProps -and ($uacProps.PSObject.Properties.Name -contains 'ConsentPromptBehaviorAdmin') -and $uacProps.ConsentPromptBehaviorAdmin -eq 0) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC set to elevate silently (ConsentPromptBehaviorAdmin = 0)' `
+    -Detail 'Administrators are elevated with no prompt, so a compromised user-context process can take full admin unattended.' `
+    -Remediation 'Set ConsentPromptBehaviorAdmin=5 (prompt for consent for non-Windows binaries) or higher.'
+}
+
+if ($uacProps -and $uacProps.LocalAccountTokenFilterPolicy -eq 1) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'Remote UAC restrictions disabled (LocalAccountTokenFilterPolicy = 1)' `
+    -Detail 'Local administrator accounts receive a full token over the network, enabling pass-the-hash and remote admin-share access with local credentials.' `
+    -Evidence $uacKey `
+    -Remediation 'Delete LocalAccountTokenFilterPolicy unless a remote-management tool documents needing it; prefer domain accounts for remote admin.'
 }
 
 $pn = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint' -ErrorAction SilentlyContinue
@@ -1273,62 +1150,38 @@ if ($null -ne $lock -and [int]$lock -gt 900) {
     -Remediation 'Cap inactivity lock at 15 minutes or less via policy.'
 }
 
-Start-Section 'ACTIVE DIRECTORY / IDENTITY'
-$domainContext = Get-DomainContext
-if (-not $domainContext) {
-  Add-Finding -Severity Info -Category 'AD' -Title 'Workgroup host (no AD domain context)'
+Start-Section 'IDENTITY / DOMAIN POSTURE (LOCAL READ ONLY)'
+$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+if ($cs -and $cs.PartOfDomain) {
+  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-joined' `
+    -Detail ("Domain: {0} (read locally from Win32_ComputerSystem; no DC queried)" -f $cs.Domain)
+  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-side AD hygiene not assessed (by design)' `
+    -Detail 'Kerberoastable SPNs, gMSA read permissions, DNS-zone ACLs and Kerberos time-skew require querying a domain controller and are intentionally out of scope for this passive host recon.' `
+    -Remediation 'Run a dedicated AD audit from a management host for domain-side abuse paths.'
 }
 else {
-  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-joined' -Detail ("Domain: {0}" -f $domainContext.Name)
+  Add-Finding -Severity Info -Category 'AD' -Title 'Workgroup host (not domain-joined)' `
+    -Detail ("Workgroup: {0}" -f $(if ($cs) { $cs.Workgroup } else { 'unknown' }))
+}
 
-  $ntlm = Get-NtlmPolicySummary
-  if ($ntlm) {
-    $lm = -1
-    if ($null -ne $ntlm.LmCompatibility) { $lm = [int]$ntlm.LmCompatibility }
-    if ($lm -ge 0 -and $lm -lt 3) {
-      Add-Finding -Severity High -Category 'AD' -Title ("LmCompatibilityLevel={0} (accepts LM/NTLMv1)" -f $lm) `
-        -Detail 'NTLMv1 downgrade = crackable challenge-response capture.' `
-        -Remediation 'Set LmCompatibilityLevel=5 (refuse LM & NTLMv1).'
-    }
-    else {
-      Add-Finding -Severity Info -Category 'AD' -Title 'NTLM minimum level acceptable (>=3)'
-    }
+$ntlm = Get-NtlmPolicySummary
+if ($ntlm) {
+  $lm = -1
+  if ($null -ne $ntlm.LmCompatibility) { $lm = [int]$ntlm.LmCompatibility }
+  if ($lm -ge 0 -and $lm -lt 3) {
+    Add-Finding -Severity High -Category 'AD' -Title ("LmCompatibilityLevel={0} (accepts LM/NTLMv1)" -f $lm) `
+      -Detail 'NTLMv1 downgrade = crackable challenge-response capture.' `
+      -Remediation 'Set LmCompatibilityLevel=5 (refuse LM & NTLMv1).'
   }
+  else {
+    Add-Finding -Severity Info -Category 'AD' -Title 'NTLM minimum level acceptable (>=3)'
+  }
+}
 
-  $dnsFindings = @(Get-WeakDnsUpdateFindings -DomainContext $domainContext)
-  if ($dnsFindings.Count -gt 0) {
-    foreach ($d in $dnsFindings) {
-      Add-Finding -Severity Medium -Category 'AD' -Title ("DNS zone '{0}' writable by {1}" -f $d.Zone, $d.Principal) `
-        -Detail ("Rights: {0} | Partition: {1} - record spoofing enables service MITM." -f $d.Rights, $d.Partition) `
-        -Remediation 'Secure dynamic updates only (DHCP-owned or specific groups); remove broad write principals.'
-    }
-  }
-
-  $spnFindings = @(Get-PrivilegedSpnTargets -DomainContext $domainContext)
-  if ($spnFindings.Count -gt 0) {
-    Add-Finding -Severity High -Category 'AD' -Title ('{0} privileged accounts with SPNs (Kerberoast targets)' -f $spnFindings.Count) `
-      -Detail (($spnFindings | ForEach-Object { '{0} [{1}]' -f $_.User, $_.Groups }) -join ' | ') `
-      -Remediation 'Remove SPNs from privileged accounts or set long (25+ char) passwords / use gMSA.'
-  }
-
-  $gmsaReport = @(Get-GmsaReadersReport -DomainContext $domainContext)
-  foreach ($g in ($gmsaReport | Where-Object { $_.WeakPrincipals -ne '' })) {
-    Add-Finding -Severity Critical -Category 'AD' -Title ("gMSA '{0}' password readable by {1}" -f $g.Account, $g.WeakPrincipals) `
-      -Remediation 'Restrict msDS-GroupMSAMembership to only the specific hosts/services that need it.'
-  }
-
-  $adcs = Get-AdcsSchannelInfo
-  if ($adcs.MappingValue -ne $null -and $adcs.UpnMapping) {
-    Add-Finding -Severity High -Category 'AD' -Title ('Schannel UPN certificate mapping enabled (ESC10 pattern, 0x{0:X})' -f [int]$adcs.MappingValue) `
-      -Remediation 'Clear the 0x4 UPN-mapping bit from CertificateMappingMethods.'
-  }
-
-  $skew = Get-TimeSkewInfo -DomainContext $domainContext
-  if ($skew -and [math]::Abs($skew.OffsetSeconds) -gt 300) {
-    Add-Finding -Severity Medium -Category 'AD' -Title ('Kerberos time skew {0:N0}s vs PDC' -f $skew.OffsetSeconds) `
-      -Detail 'Large skew breaks Kerberos and can indicate ntp tampering or stale images.' `
-      -Remediation 'Force w32tm resync; verify NTP hierarchy points to the domain PDC.'
-  }
+$adcs = Get-AdcsSchannelInfo
+if ($null -ne $adcs.MappingValue -and $adcs.UpnMapping) {
+  Add-Finding -Severity High -Category 'AD' -Title ('Schannel UPN certificate mapping enabled (ESC10 pattern, 0x{0:X})' -f [int]$adcs.MappingValue) `
+    -Remediation 'Clear the 0x4 UPN-mapping bit from CertificateMappingMethods.'
 }
 
 Start-Section 'INSTALLED SOFTWARE (baseline inventory)'
@@ -1774,7 +1627,7 @@ else {
           -Detail 'Detected via pattern; value not recorded.' `
           -Remediation 'Move to encrypted connectionStrings sections or managed identities.'
       }
-      if ($content -match '(?i)<machinekey[^>]*validation\s*=\s*"(MD5|SHA1|3DES|AES"[^"]*"?)') {
+      if ($content -match '(?i)<machinekey[^>]*\bvalidation\s*=\s*"(MD5|SHA1|3DES)"') {
         Add-Finding -Severity High -Category 'IIS' -Title ("Weak machineKey validation in {0}" -f $cfg.FullName) `
           -Detail 'MD5/SHA1/3DES ViewState signing is forgeable - ViewState deserialization RCE path.' `
           -Remediation 'Use HMACSHA256 validation; rotate autoGenerated keys.'
@@ -1866,7 +1719,26 @@ try {
       -Remediation 'Prefer Kerberos/Negotiate; Basic over HTTP is trivially sniffable.'
   }
 } catch {
-  Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM not configured on this host'
+
+  $svc = Get-Service WinRM -ErrorAction SilentlyContinue
+  $winrmPorts = @()
+  try {
+    $winrmPorts = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -in 5985, 5986 } | Select-Object -ExpandProperty LocalPort -Unique)
+  } catch { }
+  if ($svc -and $svc.Status -eq 'Running') {
+    $portTxt = if ($winrmPorts.Count) { ($winrmPorts -join ', ') } else { 'none detected' }
+    Add-Finding -Severity Medium -Category 'RemoteMgmt' -Title 'WinRM is running but its listener config was not assessed' `
+      -Detail ("WinRM service state: {0} (StartType {1}); listening ports: {2}. Listener transport/auth settings require administrator to read, so HTTP-vs-HTTPS and Basic-auth status are UNKNOWN, not clean." -f $svc.Status, $svc.StartType, $portTxt) `
+      -Remediation 'Re-run elevated to confirm the transport and auth configuration. Port 5985 indicates an HTTP listener.'
+  }
+  elseif ($svc) {
+    Add-Finding -Severity Info -Category 'RemoteMgmt' -Title ('WinRM service present but not running (state: {0})' -f $svc.Status) `
+      -Detail 'Listener configuration not read; the service is not currently accepting connections.'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM service not present on this host'
+  }
 }
 
 Start-Section 'OS VULNERABILITY SURFACE'
@@ -1939,17 +1811,28 @@ if ($activeProtos.Count -gt 0) {
 }
 
 try {
-  $cs = Get-TlsCipherSuite -ErrorAction Stop | Select-Object -ExpandProperty Name
-  $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
-  if ($weak.Count -gt 0) {
-    Add-Finding -Severity Medium -Category 'Crypto' -Title ("{0} weak cipher suites enabled" -f $weak.Count) `
-      -Detail (($weak | Select-Object -First 8) -join ', ') `
-      -Remediation 'Reorder/prune with Get-TlsCipherSuite | Disable-TlsCipherSuite; keep AEAD suites (GCM/ChaCha20).'
+
+  $suites = @(Get-TlsCipherSuite -ErrorAction Stop)
+  $cs = @($suites | ForEach-Object { $_.Name } | Where-Object { $_ })
+  if ($cs.Count -eq 0) {
+    Add-Finding -Severity Info -Category 'Crypto' -Title 'Cipher suite list not assessed' `
+      -Detail 'Get-TlsCipherSuite returned no readable suite names; weak-cipher status is unknown, not clean.'
   }
   else {
-    Add-Finding -Severity Info -Category 'Crypto' -Title ("{0} cipher suites enabled, none weak" -f $cs.Count)
+    $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
+    if ($weak.Count -gt 0) {
+      Add-Finding -Severity Medium -Category 'Crypto' -Title ("{0} of {1} enabled cipher suites are weak" -f $weak.Count, $cs.Count) `
+        -Detail (($weak | Select-Object -First 8) -join ', ') `
+        -Remediation 'Prune with Disable-TlsCipherSuite -Name <suite>; keep AEAD suites (GCM/ChaCha20) only.'
+    }
+    else {
+      Add-Finding -Severity Info -Category 'Crypto' -Title ("{0} cipher suites enabled, none weak" -f $cs.Count)
+    }
   }
-} catch { }
+} catch {
+  Add-Finding -Severity Info -Category 'Crypto' -Title 'Cipher suite enumeration failed' `
+    -Detail ('Get-TlsCipherSuite error: ' + $_.Exception.Message + '. Weak-cipher status not assessed.')
+}
 
 $fips = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsPolicyGroup' -ErrorAction SilentlyContinue).Enabled
 $fips2 = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name FipsAlgorithmPolicy -ErrorAction SilentlyContinue
@@ -2016,8 +1899,13 @@ foreach ($runtimeVer in @('v2.0.50727', 'v4.0.30319')) {
   }
 }
 
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'OS' -Title 'Local security policy (secedit) not assessed (needs elevation)' `
+    -Detail 'secedit /export requires administrator; run elevated to verify minimum password length, account-lockout threshold and anonymous-lookup policy.'
+}
+elseif ($true) {
 try {
-  $secOut = "$env:TEMP\bluepeas_secedit.cfg"
+  $secOut = "$env:TEMP\winhostpeas_secedit.cfg"
   secedit /export /cfg $secOut /quiet 2>$null | Out-Null
   if (Test-Path $secOut) {
     $sec = Get-Content $secOut -ErrorAction SilentlyContinue
@@ -2047,6 +1935,7 @@ try {
     Remove-Item $secOut -Force -ErrorAction SilentlyContinue
   }
 } catch { }
+}
 
 $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
 if ($ts) {
@@ -2059,18 +1948,24 @@ if ($ts) {
   }
 }
 
-$bcdTest = $null
-try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
-if ($bcdTest) {
-  Add-Finding -Severity High -Category 'OS' -Title 'Test signing mode enabled (bcdedit testsigning)' `
-    -Detail 'Unsigned kernel drivers load freely - rootkit path.' `
-    -Remediation 'bcdedit /set testsigning off; investigate why it was on.'
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'OS' -Title 'Boot config (bcdedit) not assessed (needs elevation)' `
+    -Detail 'bcdedit /enum requires administrator; run elevated to detect test-signing mode and disabled code-integrity (nointegritychecks).'
 }
-$nointegritychecks = $null
-try { $nointegritychecks = (bcdedit /enum `{current`} 2>$null | Select-String 'nointegritychecks\s+Yes') } catch { }
-if ($nointegritychecks) {
-  Add-Finding -Severity High -Category 'OS' -Title 'Code-integrity checks disabled (nointegritychecks)' `
-    -Remediation 'bcdedit /set nointegritychecks on (restore) - disabled CI allows unsigned code at boot.'
+else {
+  $bcdTest = $null
+  try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
+  if ($bcdTest) {
+    Add-Finding -Severity High -Category 'OS' -Title 'Test signing mode enabled (bcdedit testsigning)' `
+      -Detail 'Unsigned kernel drivers load freely - rootkit path.' `
+      -Remediation 'bcdedit /set testsigning off; investigate why it was on.'
+  }
+  $nointegritychecks = $null
+  try { $nointegritychecks = (bcdedit /enum `{current`} 2>$null | Select-String 'nointegritychecks\s+Yes') } catch { }
+  if ($nointegritychecks) {
+    Add-Finding -Severity High -Category 'OS' -Title 'Code-integrity checks disabled (nointegritychecks)' `
+      -Remediation 'bcdedit /set nointegritychecks off (restores integrity enforcement); disabled CI allows unsigned code at boot.'
+  }
 }
 
 $nullDevice = $null
@@ -2131,8 +2026,12 @@ try {
         -Remediation 'Permanent WMI subscriptions survive reboots and run as SYSTEM. Baseline a clean image; anything not from your build = remove + investigate.'
     }
   }
-  else {
+  elseif ($script:IsElevated) {
     Add-Finding -Severity Info -Category 'Persistence' -Title 'No WMI permanent event consumers'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'WMI event subscriptions not assessed (needs elevation)' `
+      -Detail 'Enumerating root\subscription requires administrator; run elevated to detect WMI-based fileless persistence.'
   }
 } catch { }
 
@@ -2261,30 +2160,52 @@ Start-Section 'IMAGE HARDENING BASELINE'
 try {
   $prefs = Get-MpPreference -ErrorAction Stop
   $asrIds = @{
-    '56a863a9-8df3-4e41-9a2e-6de5b9d7a1bd' = 'Abuse of vulnerable signed drivers (LOLBins)'
-    '7674ba52-37eb-4a4f-a9a1-f0f9a1619b2b' = 'Adobe Reader child-process spawn'
-    'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 'Office apps child-process spawn'
-    '9e6c4cd1-2c9c-4deb-a2b3-82c2de07b19b' = 'Office apps creating executable content'
-    'b2b3f03d-6a44-4d6f-a68a-d5f3a5b0f9c4' = 'Office macro code winning APIs'
-    'e6db88a8-b28b-4c36-9463-6d50a5e3d4b0' = 'Credential stealing from LSASS (ref)'
-    '3b576869-a4ec-4529-8536-b6a2e5f3d7c1' = 'WMI event subscription persistence'
-    'be9ba2d9-53ea-4cdc-84e5-9b1d1b0f5c1e' = 'Ransomware protection (controlled folder access companion)'
-    '5beb7efe-fd9a-4556-801d-bd0a5f6f7a1c' = 'Untrusted/unsigned processes from USB'
-    'd3e037e1-3eb8-44c8-a5a0-2e0f0b5a1a2b' = 'JS/VBS launching script interpreters'
-    '92e97ca1-2edf-4476-bdd6-9a0f0d6a1a2c' = 'Office communication apps child-process'
-    'c1db55ab-c21a-4837-a377-f0f1e2b3c4d5' = 'WPS/Explorer exploit-guard extras'
-    '26190899-1602-49e8-8b27-eb1d0a1baac6' = 'Office dropping executable content'
-    '33ddedf1-c6ed-4bb3-a5a5-9a0f0d6a1a2d' = 'Persist through WMI (alt id)'
+    '56a863a9-875e-4185-98a7-b882c64b5ce5' = 'Block abuse of exploited vulnerable signed drivers'
+    '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 'Block credential stealing from LSASS'
+    'e6db77e5-3df2-4cf1-b95a-636979351e5b' = 'Block persistence through WMI event subscription'
+    '7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c' = 'Block Adobe Reader from creating child processes'
+    'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 'Block all Office apps from creating child processes'
+    'be9ba2d9-53ea-4cdc-84e5-9b1eeee46550' = 'Block executable content from email/webmail'
+    '01443614-cd74-433a-b99e-2ecdc07bfc25' = 'Block executables not meeting prevalence/age/trust'
+    '5beb7efe-fd9a-4556-801d-275e5ffc04cc' = 'Block execution of potentially obfuscated scripts'
+    'd3e037e1-3eb8-44c8-a917-57927947596d' = 'Block JS/VBScript launching downloaded executables'
+    '3b576869-a4ec-4529-8536-b80a7769e899' = 'Block Office apps creating executable content'
+    '75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84' = 'Block Office apps injecting into other processes'
+    '26190899-1602-49e8-8b27-eb1d0a1ce869' = 'Block Office comms app creating child processes'
+    'd1e49aac-8f56-4280-b9ba-993a6d77406c' = 'Block PSExec/WMI process creation'
+    '33ddedf1-c6e0-47cb-833e-de6133960387' = 'Block rebooting machine in Safe Mode'
+    'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 'Block untrusted/unsigned processes from USB'
+    'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'Block use of copied/impersonated system tools'
+    'a8f5898e-1dc8-49a9-9878-85004b8a61e6' = 'Block webshell creation for servers'
+    '92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b' = 'Block Win32 API calls from Office macros'
+    'c1db55ab-c21a-4637-bb3f-a12568109d35' = 'Use advanced ransomware protection'
   }
-  $enabled = @($prefs.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
-  if ($enabled.Count -eq 0) {
-    Add-Finding -Severity High -Category 'Hardening' -Title 'Defender ASR rules: NONE enabled' `
-      -Detail 'ASR blocks the exact techniques this tool detects (WMI persistence, LSASS abuse, Office child-process, USB payloads).' `
-      -Remediation 'Enable the full ASR rule set in block mode via GPO/Intune (AttackSurfaceReductionRules_Ids/Actions).'
+
+  $ruleIds = @($prefs.AttackSurfaceReductionRules_Ids)
+  $ruleActions = @($prefs.AttackSurfaceReductionRules_Actions)
+  $blocking = New-Object System.Collections.Generic.List[string]
+  $auditing = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $ruleIds.Count; $i++) {
+    $id = "$($ruleIds[$i])".ToLower()
+    if (-not $id) { continue }
+    $act = if ($i -lt $ruleActions.Count) { [int]$ruleActions[$i] } else { 0 }
+    $label = if ($asrIds[$id]) { $asrIds[$id] } else { $id }
+    if ($act -eq 1) { $blocking.Add($label) }
+    elseif ($act -eq 2 -or $act -eq 6) { $auditing.Add($label) }
+  }
+  if ($blocking.Count -eq 0) {
+    Add-Finding -Severity High -Category 'Hardening' -Title ('Defender ASR rules: none in Block mode ({0} audit/warn)' -f $auditing.Count) `
+      -Detail 'ASR blocks the exact techniques this tool detects (WMI persistence, LSASS abuse, Office child-process, USB payloads). Audit/warn rules only log - they do not stop the technique.' `
+      -Remediation 'Enable the ASR rule set in Block mode via GPO/Intune (set AttackSurfaceReductionRules_Actions to 1, not 2/6).'
   }
   else {
-    Add-Finding -Severity Info -Category 'Hardening' -Title ("Defender ASR rules: {0} enabled" -f $enabled.Count) `
-      -Detail (($enabled | ForEach-Object { if ($asrIds["$_"]) { $asrIds["$_"] } else { $_ } }) -join ' | ')
+    Add-Finding -Severity Info -Category 'Hardening' -Title ("Defender ASR rules: {0} in Block mode" -f $blocking.Count) `
+      -Detail (($blocking -join ' | ') + $(if ($auditing.Count) { ' || audit/warn only: ' + ($auditing -join ', ') } else { '' }))
+  }
+  if ($blocking.Count -gt 0 -and $auditing.Count -gt 0) {
+    Add-Finding -Severity Low -Category 'Hardening' -Title ("{0} ASR rules are audit/warn only (not blocking)" -f $auditing.Count) `
+      -Detail ($auditing -join ', ') `
+      -Remediation 'Promote audited rules to Block once validated; audit mode logs the technique but allows it.'
   }
   $cfa = $prefs.EnableControlledFolderAccess
   if ($cfa -eq 1) { Add-Finding -Severity Info -Category 'Hardening' -Title 'Controlled Folder Access (ransomware guard) ON' }
@@ -2418,7 +2339,7 @@ foreach ($rk in @(
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymousSAM'; Want = 1 },
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareWks'; Want = 0 },
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareServer'; Want = 0 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\RemoteRegistry'; Name = 'Start'; Want = 4 }
+  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry'; Name = 'Start'; Want = 4 }
 )) {
   $v = (Get-ItemProperty $rk.Key -Name $rk.Name -ErrorAction SilentlyContinue).($rk.Name)
   if ($null -ne $v -and [int]$v -ne [int]$rk.Want) {
@@ -2500,18 +2421,22 @@ else {
   $script:Exec.DevicesSeen = $arp.Count
 }
 
+function ConvertFrom-NetworkListSystemTime($val) {
+
+  if (-not $val) { return $null }
+  try {
+    $b = [byte[]]$val
+    if ($b.Count -ne 16) { return $null }
+    $yr = [BitConverter]::ToUInt16($b, 0)
+    if ($yr -lt 1980 -or $yr -gt 2400) { return $null }
+    return (Get-Date -Year $yr -Month ([BitConverter]::ToUInt16($b, 2)) -Day ([BitConverter]::ToUInt16($b, 6)) `
+        -Hour ([BitConverter]::ToUInt16($b, 8)) -Minute ([BitConverter]::ToUInt16($b, 10)) -Second ([BitConverter]::ToUInt16($b, 12)) -ErrorAction Stop)
+  } catch { return $null }
+}
+
 Start-Section 'CONNECTIVITY HISTORY (PREVIOUSLY CONNECTED / TALKED TO)'
 
 try {
-  $sig = @'
-using System;
-using System.Runtime.InteropServices;
-public static class NetList {
-  [DllImport("ole32.dll")]
-  public static extern uint CLSIDFromString(string lpsz, out Guid pclsid);
-}
-'@
-  Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
   $paths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles',
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged',
@@ -2525,16 +2450,8 @@ public static class NetList {
       $name = $props.ProfileName
       if (-not $name) { $name = $props.Description }
       if (-not $name) { return }
-      $first = $null; $last = $null
-      if ($props.DateCreated) {
-        try {
-          $b = [byte[]]$props.DateCreated
-          if ($b.Count -eq 16) {
-            $first = [datetime]::FromFileTime([BitConverter]::ToInt64($b, 8))
-            $last = [datetime]::FromFileTime([BitConverter]::ToInt64($b, 0))
-          }
-        } catch { }
-      }
+      $first = ConvertFrom-NetworkListSystemTime $props.DateCreated
+      $last = ConvertFrom-NetworkListSystemTime $props.DateLastConnected
       $nets += [pscustomobject]@{
         Name = $name; Type = $(if ($props.Category -eq 1) { 'Private' } elseif ($props.Category -eq 0) { 'Public' } else { 'Domain/Other' })
         FirstSeen = $first; LastConnected = $last; Path = $_.PSChildName
@@ -2549,7 +2466,7 @@ public static class NetList {
   if (@($dedup).Count -eq 0 -and -not $netListReadable) {
     Add-Finding -Severity Info -Category 'History' -Title 'NetworkList history unreadable without elevation' `
       -Detail 'The NetworkList registry key requires admin. Run elevated to capture previously-connected network history.' `
-      -Remediation 'Schedule BlueWinPEAS elevated for full connectivity history.'
+      -Remediation 'Schedule WinHostPEAS elevated for full connectivity history.'
   }
   else {
     Add-Finding -Severity Info -Category 'History' -Title ('{0} distinct networks previously connected (NetworkList)' -f @($dedup).Count) `
@@ -2674,6 +2591,204 @@ try {
   }
 } catch { }
 
+Start-Section 'ADVANCED PERSISTENCE + OBFUSCATION DETECTION'
+
+$script:ObfPattern = '(?i)(?:\B-e(?:nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{16,})|IEX\s*\(|Invoke-Expression|FromBase64String|DownloadString|DownloadFile|Net\.WebClient|Reflection\.Assembly\]::Load|scrobj\.dll|RunHTMLApplication|(?:certutil|bitsadmin).*(?:-decode|-urlcache)'
+
+$uacBypassKeys = @(
+  @{ Key = 'HKCU:\Software\Classes\ms-settings\Shell\Open\command'; Name = 'fodhelper / computerdefaults (ms-settings)' }
+  @{ Key = 'HKCU:\Software\Classes\mscfile\Shell\Open\command'; Name = 'eventvwr / mmc (mscfile)' }
+  @{ Key = 'HKCU:\Software\Classes\exefile\Shell\Open\command'; Name = 'exefile association hijack' }
+  @{ Key = 'HKCU:\Software\Classes\Applications\powershell.exe\shell\open\command'; Name = 'PowerShell application hijack' }
+  @{ Key = 'HKCU:\Software\Classes\Folder\shell\Open\command'; Name = 'Folder class hijack' }
+  @{ Key = 'HKCU:\Software\Classes\Drive\shell\Open\command'; Name = 'Drive class hijack (sdclt)' }
+  @{ Key = 'HKCU:\Software\Classes\Launcher.SystemSettings\shell\open\command'; Name = 'SystemSettings launcher hijack' }
+)
+foreach ($u in $uacBypassKeys) {
+  if (-not (Test-Path $u.Key)) { continue }
+  $props = Get-ItemProperty $u.Key -ErrorAction SilentlyContinue
+  $val = $props.'(default)'
+  $hasDelegate = $props -and ($props.PSObject.Properties.Name -contains 'DelegateExecute')
+
+  if ($val -or $hasDelegate) {
+    Add-Finding -Severity Critical -Category 'Persistence' -Title ("UAC bypass registry residue: {0}" -f $u.Name) `
+      -Detail ("Key: {0} | Command: {1} | DelegateExecute present: {2} - auto-elevates via a trusted signed binary (MITRE T1548.002)." -f $u.Key, $val, $hasDelegate) `
+      -Evidence $u.Key `
+      -Remediation 'Delete the key. These HKCU class overrides have no legitimate use; presence on a golden image indicates prior compromise.'
+  }
+}
+
+$progIdDefaults = @{
+  'exefile'  = '"%1" %*'
+  'comfile'  = '"%1" %*'
+  'batfile'  = '"%1" %*'
+  'cmdfile'  = '"%1" %*'
+  'piffile'  = '"%1" %*'
+  'scrfile'  = '"%1" /S'
+}
+$progIdWatch = @('exefile', 'comfile', 'batfile', 'cmdfile', 'piffile', 'scrfile', 'htafile', 'txtfile', 'regfile', 'Folder', 'Directory', 'Drive')
+foreach ($hive in @('HKLM:\Software\Classes', 'HKCU:\Software\Classes')) {
+  foreach ($progId in $progIdWatch) {
+    $cmdKey = Join-Path $hive "$progId\shell\open\command"
+    if (-not (Test-Path $cmdKey)) { continue }
+    $val = "$((Get-ItemProperty $cmdKey -ErrorAction SilentlyContinue).'(default)')"
+    if (-not $val) { continue }
+    if ($val -match $script:ObfPattern) {
+      Add-Finding -Severity Critical -Category 'Persistence' -Title ("File-association hijacked with obfuscated command: {0}" -f $progId) `
+        -Detail ("Key: {0} | Command: {1} - every launch of this file type runs attacker code." -f $cmdKey, $val) `
+        -Evidence $cmdKey `
+        -Remediation ('Restore the default handler for {0} and hunt for the dropper that set it.' -f $progId)
+    }
+    elseif ($progIdDefaults.ContainsKey($progId) -and $val -ne $progIdDefaults[$progId]) {
+      Add-Finding -Severity High -Category 'Persistence' -Title ("Non-default handler for {0}" -f $progId) `
+        -Detail ("Key: {0} | Command: {1} | Expected: {2}" -f $cmdKey, $val, $progIdDefaults[$progId]) `
+        -Evidence $cmdKey `
+        -Remediation ('Executable-class handlers should be exactly {0}. Anything else intercepts every execution of that type.' -f $progIdDefaults[$progId])
+    }
+  }
+}
+
+try {
+  foreach ($s in (Get-CimInstance Win32_Service -ErrorAction Stop)) {
+    $fc = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Name)" -Name FailureCommand -ErrorAction SilentlyContinue).FailureCommand
+    if (-not $fc) { continue }
+
+    $isObf = $fc -match $script:ObfPattern
+    $isOutside = $fc -notmatch '(?i)^"?(%SystemRoot%|C:\\Windows|C:\\Program Files)'
+    if ($isObf -or $isOutside) {
+      Add-Finding -Severity High -Category 'Persistence' -Title ("Service recovery command is non-standard: {0}" -f $s.Name) `
+        -Detail ("FailureCommand: {0} - runs as SYSTEM when the service crashes, so an attacker can trigger it on demand." -f $fc) `
+        -Evidence ("HKLM\SYSTEM\CurrentControlSet\Services\{0}" -f $s.Name) `
+        -Remediation 'A legitimate recovery action should be a signed binary under Windows or Program Files, never an inline interpreter command.'
+    }
+  }
+} catch { }
+
+try {
+  $amsiProviders = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\AMSI\Providers' -ErrorAction SilentlyContinue)
+  if ($amsiProviders.Count -eq 0) {
+    Add-Finding -Severity High -Category 'Obfuscation' -Title 'No AMSI providers registered' `
+      -Detail 'AMSI feeds PowerShell/VBS/JS content to the AV engine at runtime. With no provider registered, script content is never scanned.' `
+      -Remediation 'Expect at least the Defender provider {2781761E-28E0-4109-99FE-B9D127C57AFE}. Investigate why it was removed.'
+  }
+  else {
+    $resolved = foreach ($p in $amsiProviders) {
+      $clsid = $p.PSChildName
+      $dll = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+
+      if ($dll -and $dll -notmatch '(?i)^"?(C:\\Windows|C:\\Program Files|%ProgramFiles%|C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\)') {
+        Add-Finding -Severity Critical -Category 'Obfuscation' -Title ("AMSI provider DLL outside protected path: {0}" -f $clsid) `
+          -Detail ("DLL: {0} - a rogue AMSI provider can silently pass all content as clean." -f $dll) `
+          -Evidence $clsid `
+          -Remediation 'Remove the provider registration and investigate the DLL.'
+      }
+      ("{0}{1}" -f $clsid, $(if ($dll) { " -> $dll" } else { '' }))
+    }
+    Add-Finding -Severity Info -Category 'Obfuscation' -Title ("{0} AMSI provider(s) registered" -f $amsiProviders.Count) `
+      -Detail (($resolved | Select-Object -First 5) -join ' | ')
+  }
+  if (Test-Path 'HKCU:\SOFTWARE\Microsoft\AMSI\Providers') {
+    Add-Finding -Severity High -Category 'Obfuscation' -Title 'AMSI provider override present in HKCU' `
+      -Detail 'Per-user AMSI provider registration is not a supported configuration and can redirect scanning for the current user.' `
+      -Remediation 'Delete HKCU\SOFTWARE\Microsoft\AMSI and investigate.'
+  }
+} catch { }
+
+try {
+  $histPath = $null
+  try { $histPath = (Get-PSReadLineOption -ErrorAction Stop).HistorySavePath } catch { }
+  if (-not $histPath) {
+
+    $histPath = Join-Path $env:APPDATA 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+  }
+  if (Test-Path $histPath) {
+    $hits = New-Object System.Collections.Generic.List[string]
+    $ln = 0
+    foreach ($line in (Get-Content $histPath -ErrorAction SilentlyContinue)) {
+      $ln++
+      if ($line -match $script:ObfPattern) { $hits.Add("line ${ln}: $(Get-Redacted $line)") }
+      if ($hits.Count -ge 8) { break }
+    }
+    if ($hits.Count -gt 0) {
+      Add-Finding -Severity High -Category 'Obfuscation' -Title ("Obfuscated/encoded PowerShell in console history ({0} hits)" -f $hits.Count) `
+        -Detail ($hits -join ' | ') `
+        -Evidence $histPath `
+        -Remediation 'Investigate each hit. Encoded commands plus IEX/DownloadString is the signature of fileless tooling; rotate any credentials that were in scope.'
+    }
+  }
+} catch { }
+
+try {
+  $allTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+  foreach ($t in $allTasks) {
+    foreach ($a in @($t.Actions)) {
+      if (-not $a.Execute) { continue }
+      $cmd = ("{0} {1}" -f $a.Execute, $a.Arguments).Trim()
+
+      if ($cmd -match $script:ObfPattern) {
+        Add-Finding -Severity High -Category 'Obfuscation' -Title ("Scheduled task with obfuscated command: {0}" -f $t.TaskName) `
+          -Detail ("Path: {0} | Command: {1} | State: {2}" -f $t.TaskPath, (Get-Redacted $cmd), $t.State) `
+          -Evidence ("{0}{1}" -f $t.TaskPath, $t.TaskName) `
+          -Remediation 'Investigate. Encoded PowerShell or regsvr32+scrobj.dll in a task is classic fileless persistence (T1053.005 / T1218).'
+      }
+
+      if ($t.TaskPath -notlike '\Microsoft*') {
+        $exe = ($a.Execute -replace '"', '')
+        if ($exe -match '(?i)^[A-Z]:\\(ProgramData|Users\\[^\\]+\\AppData|Temp|Public)') {
+          Add-Finding -Severity High -Category 'Masquerading' -Title ("Task binary in user-writable path: {0}" -f $t.TaskName) `
+            -Detail ("Path: {0} - an executable in a user-writable directory can be swapped without touching the task definition." -f $exe) `
+            -Evidence $exe `
+            -Remediation 'Relocate the binary under Program Files, or validate it against the authorized task baseline.'
+        }
+      }
+    }
+  }
+} catch { }
+
+try {
+  $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+
+  $coreRe = '^(svchost|lsass|csrss|winlogon|smss|services|spoolsv)\.exe$'
+  foreach ($p in @($procs | Where-Object {
+        $_.ExecutablePath -and (
+          ($_.Name -match $coreRe -and $_.ExecutablePath -notmatch '(?i)^C:\\Windows\\(System32|SysWOW64|WinSxS)\\') -or
+          ($_.Name -match '^explorer\.exe$' -and $_.ExecutablePath -notmatch '(?i)^C:\\Windows\\(explorer\.exe|SysWOW64\\|WinSxS\\)')
+        )
+      } | Select-Object -First 10)) {
+    Add-Finding -Severity Critical -Category 'Masquerading' -Title ("{0} running from non-standard path" -f $p.Name) `
+      -Detail ("Path: {0} | PID: {1} - a core Windows binary outside System32/SysWOW64 is T1036 masquerading." -f $p.ExecutablePath, $p.ProcessId) `
+      -Evidence $p.ExecutablePath `
+      -Remediation 'Isolate the host and investigate. Genuine svchost/lsass/csrss always run from System32.'
+  }
+  foreach ($c in @($procs | Where-Object {
+        $_.Name -match '^(cmd|powershell|pwsh|wscript|cscript|mshta|regsvr32|rundll32)\.exe$' -and
+        $_.CommandLine -match $script:ObfPattern
+      } | Select-Object -First 5)) {
+    $parent = $procs | Where-Object { $_.ProcessId -eq $c.ParentProcessId } | Select-Object -First 1
+    Add-Finding -Severity High -Category 'Obfuscation' -Title ("Obfuscated command line running now: {0} (PID {1})" -f $c.Name, $c.ProcessId) `
+      -Detail ("Parent: {0} (PID {1}) | Command redacted: {2}" -f $(if ($parent) { $parent.Name } else { 'unknown' }), $c.ParentProcessId, (Get-Redacted $c.CommandLine)) `
+      -Remediation 'Investigate the parent. Encoded PowerShell spawned by Office or a browser is a live fileless attack.'
+  }
+  if (-not $script:IsElevated) {
+    Add-Finding -Severity Low -Category 'Masquerading' -Title 'Process command lines only partly visible (needs elevation)' `
+      -Detail 'Without administrator rights, ExecutablePath and CommandLine are hidden for processes owned by other users, so masquerading in those processes is not assessed.' `
+      -Remediation 'Re-run elevated for full process-level coverage.'
+  }
+} catch { }
+
+if ($script:IsElevated) {
+  try {
+    $taskCount = @(Get-ChildItem 'C:\Windows\System32\Tasks' -Recurse -File -ErrorAction SilentlyContinue).Count
+    Add-Finding -Severity Info -Category 'Persistence' -Title ("{0} scheduled task definition files on disk" -f $taskCount) `
+      -Detail 'Counted recursively under C:\Windows\System32\Tasks.' `
+      -Remediation 'Baseline this count on the golden image; an unexplained increase means new tasks were registered.'
+  } catch { }
+}
+else {
+  Add-Finding -Severity Info -Category 'Persistence' -Title 'Scheduled task file baseline not assessed (needs elevation)' `
+    -Detail 'C:\Windows\System32\Tasks is not readable without administrator rights.'
+}
+
 Start-Section 'SUMMARY'
 $total = $script:Findings.Count
 Write-Host ''
@@ -2702,5 +2817,6 @@ Write-Host ("Exit code will be {0} (Critical+High count) for unattended triage."
 exit $exitCode
 
 Write-Host ''
-Write-Host 'BlueWinPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+Write-Host 'WinHostPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+
 

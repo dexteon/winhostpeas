@@ -1,70 +1,44 @@
 
-######################## AD / DOMAIN MISCONFIG CHECKS ########################
-# Retained winPEAS AD functions, recast as findings (attacker-relevant abuse
-# paths reported as risk + fix, no exploitation guidance).
+######################## IDENTITY / DOMAIN POSTURE (LOCAL READ ONLY) ########################
+# Local-only identity posture. Domain membership is read from local WMI; the
+# NTLM and Schannel checks read local registry. NO domain controller is queried
+# - the winPEAS LDAP/Kerberoast/gMSA/DNS-ACL/time-skew checks were removed
+# because they send packets to a DC, and this tool is strictly local host recon.
 
-Start-Section 'ACTIVE DIRECTORY / IDENTITY'
-$domainContext = Get-DomainContext
-if (-not $domainContext) {
-  Add-Finding -Severity Info -Category 'AD' -Title 'Workgroup host (no AD domain context)'
+Start-Section 'IDENTITY / DOMAIN POSTURE (LOCAL READ ONLY)'
+$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+if ($cs -and $cs.PartOfDomain) {
+  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-joined' `
+    -Detail ("Domain: {0} (read locally from Win32_ComputerSystem; no DC queried)" -f $cs.Domain)
+  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-side AD hygiene not assessed (by design)' `
+    -Detail 'Kerberoastable SPNs, gMSA read permissions, DNS-zone ACLs and Kerberos time-skew require querying a domain controller and are intentionally out of scope for this passive host recon.' `
+    -Remediation 'Run a dedicated AD audit from a management host for domain-side abuse paths.'
 }
 else {
-  Add-Finding -Severity Info -Category 'AD' -Title 'Domain-joined' -Detail ("Domain: {0}" -f $domainContext.Name)
+  Add-Finding -Severity Info -Category 'AD' -Title 'Workgroup host (not domain-joined)' `
+    -Detail ("Workgroup: {0}" -f $(if ($cs) { $cs.Workgroup } else { 'unknown' }))
+}
 
-  # NTLM policy posture
-  $ntlm = Get-NtlmPolicySummary
-  if ($ntlm) {
-    $lm = -1
-    if ($null -ne $ntlm.LmCompatibility) { $lm = [int]$ntlm.LmCompatibility }
-    if ($lm -ge 0 -and $lm -lt 3) {
-      Add-Finding -Severity High -Category 'AD' -Title ("LmCompatibilityLevel={0} (accepts LM/NTLMv1)" -f $lm) `
-        -Detail 'NTLMv1 downgrade = crackable challenge-response capture.' `
-        -Remediation 'Set LmCompatibilityLevel=5 (refuse LM & NTLMv1).'
-    }
-    else {
-      Add-Finding -Severity Info -Category 'AD' -Title 'NTLM minimum level acceptable (>=3)'
-    }
+# NTLM policy posture (local registry - relevant on any host)
+$ntlm = Get-NtlmPolicySummary
+if ($ntlm) {
+  $lm = -1
+  if ($null -ne $ntlm.LmCompatibility) { $lm = [int]$ntlm.LmCompatibility }
+  if ($lm -ge 0 -and $lm -lt 3) {
+    Add-Finding -Severity High -Category 'AD' -Title ("LmCompatibilityLevel={0} (accepts LM/NTLMv1)" -f $lm) `
+      -Detail 'NTLMv1 downgrade = crackable challenge-response capture.' `
+      -Remediation 'Set LmCompatibilityLevel=5 (refuse LM & NTLMv1).'
   }
+  else {
+    Add-Finding -Severity Info -Category 'AD' -Title 'NTLM minimum level acceptable (>=3)'
+  }
+}
 
-  # Insecure dynamic DNS ACLs
-  $dnsFindings = @(Get-WeakDnsUpdateFindings -DomainContext $domainContext)
-  if ($dnsFindings.Count -gt 0) {
-    foreach ($d in $dnsFindings) {
-      Add-Finding -Severity Medium -Category 'AD' -Title ("DNS zone '{0}' writable by {1}" -f $d.Zone, $d.Principal) `
-        -Detail ("Rights: {0} | Partition: {1} - record spoofing enables service MITM." -f $d.Rights, $d.Partition) `
-        -Remediation 'Secure dynamic updates only (DHCP-owned or specific groups); remove broad write principals.'
-    }
-  }
-
-  # Kerberoastable privileged SPN accounts
-  $spnFindings = @(Get-PrivilegedSpnTargets -DomainContext $domainContext)
-  if ($spnFindings.Count -gt 0) {
-    Add-Finding -Severity High -Category 'AD' -Title ('{0} privileged accounts with SPNs (Kerberoast targets)' -f $spnFindings.Count) `
-      -Detail (($spnFindings | ForEach-Object { '{0} [{1}]' -f $_.User, $_.Groups }) -join ' | ') `
-      -Remediation 'Remove SPNs from privileged accounts or set long (25+ char) passwords / use gMSA.'
-  }
-
-  # gMSA readable by broad groups
-  $gmsaReport = @(Get-GmsaReadersReport -DomainContext $domainContext)
-  foreach ($g in ($gmsaReport | Where-Object { $_.WeakPrincipals -ne '' })) {
-    Add-Finding -Severity Critical -Category 'AD' -Title ("gMSA '{0}' password readable by {1}" -f $g.Account, $g.WeakPrincipals) `
-      -Remediation 'Restrict msDS-GroupMSAMembership to only the specific hosts/services that need it.'
-  }
-
-  # ADCS Schannel UPN mapping (ESC10)
-  $adcs = Get-AdcsSchannelInfo
-  if ($adcs.MappingValue -ne $null -and $adcs.UpnMapping) {
-    Add-Finding -Severity High -Category 'AD' -Title ('Schannel UPN certificate mapping enabled (ESC10 pattern, 0x{0:X})' -f [int]$adcs.MappingValue) `
-      -Remediation 'Clear the 0x4 UPN-mapping bit from CertificateMappingMethods.'
-  }
-
-  # Time skew (Kerberos health)
-  $skew = Get-TimeSkewInfo -DomainContext $domainContext
-  if ($skew -and [math]::Abs($skew.OffsetSeconds) -gt 300) {
-    Add-Finding -Severity Medium -Category 'AD' -Title ('Kerberos time skew {0:N0}s vs PDC' -f $skew.OffsetSeconds) `
-      -Detail 'Large skew breaks Kerberos and can indicate ntp tampering or stale images.' `
-      -Remediation 'Force w32tm resync; verify NTP hierarchy points to the domain PDC.'
-  }
+# ADCS Schannel UPN certificate mapping (ESC10 pattern) - local registry read
+$adcs = Get-AdcsSchannelInfo
+if ($null -ne $adcs.MappingValue -and $adcs.UpnMapping) {
+  Add-Finding -Severity High -Category 'AD' -Title ('Schannel UPN certificate mapping enabled (ESC10 pattern, 0x{0:X})' -f [int]$adcs.MappingValue) `
+    -Remediation 'Clear the 0x4 UPN-mapping bit from CertificateMappingMethods.'
 }
 
 ######################## INSTALLED SOFTWARE BASELINE ########################

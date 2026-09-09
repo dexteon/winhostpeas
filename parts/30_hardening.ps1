@@ -57,8 +57,12 @@ try {
         -Remediation 'Permanent WMI subscriptions survive reboots and run as SYSTEM. Baseline a clean image; anything not from your build = remove + investigate.'
     }
   }
-  else {
+  elseif ($script:IsElevated) {
     Add-Finding -Severity Info -Category 'Persistence' -Title 'No WMI permanent event consumers'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'WMI event subscriptions not assessed (needs elevation)' `
+      -Detail 'Enumerating root\subscription requires administrator; run elevated to detect WMI-based fileless persistence.'
   }
 } catch { }
 
@@ -199,31 +203,55 @@ Start-Section 'IMAGE HARDENING BASELINE'
 # --- Defender ASR rules ---
 try {
   $prefs = Get-MpPreference -ErrorAction Stop
+  # Canonical Microsoft ASR rule GUIDs (learn.microsoft.com ASR rules reference).
   $asrIds = @{
-    '56a863a9-8df3-4e41-9a2e-6de5b9d7a1bd' = 'Abuse of vulnerable signed drivers (LOLBins)'
-    '7674ba52-37eb-4a4f-a9a1-f0f9a1619b2b' = 'Adobe Reader child-process spawn'
-    'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 'Office apps child-process spawn'
-    '9e6c4cd1-2c9c-4deb-a2b3-82c2de07b19b' = 'Office apps creating executable content'
-    'b2b3f03d-6a44-4d6f-a68a-d5f3a5b0f9c4' = 'Office macro code winning APIs'
-    'e6db88a8-b28b-4c36-9463-6d50a5e3d4b0' = 'Credential stealing from LSASS (ref)'
-    '3b576869-a4ec-4529-8536-b6a2e5f3d7c1' = 'WMI event subscription persistence'
-    'be9ba2d9-53ea-4cdc-84e5-9b1d1b0f5c1e' = 'Ransomware protection (controlled folder access companion)'
-    '5beb7efe-fd9a-4556-801d-bd0a5f6f7a1c' = 'Untrusted/unsigned processes from USB'
-    'd3e037e1-3eb8-44c8-a5a0-2e0f0b5a1a2b' = 'JS/VBS launching script interpreters'
-    '92e97ca1-2edf-4476-bdd6-9a0f0d6a1a2c' = 'Office communication apps child-process'
-    'c1db55ab-c21a-4837-a377-f0f1e2b3c4d5' = 'WPS/Explorer exploit-guard extras'
-    '26190899-1602-49e8-8b27-eb1d0a1baac6' = 'Office dropping executable content'
-    '33ddedf1-c6ed-4bb3-a5a5-9a0f0d6a1a2d' = 'Persist through WMI (alt id)'
+    '56a863a9-875e-4185-98a7-b882c64b5ce5' = 'Block abuse of exploited vulnerable signed drivers'
+    '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 'Block credential stealing from LSASS'
+    'e6db77e5-3df2-4cf1-b95a-636979351e5b' = 'Block persistence through WMI event subscription'
+    '7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c' = 'Block Adobe Reader from creating child processes'
+    'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 'Block all Office apps from creating child processes'
+    'be9ba2d9-53ea-4cdc-84e5-9b1eeee46550' = 'Block executable content from email/webmail'
+    '01443614-cd74-433a-b99e-2ecdc07bfc25' = 'Block executables not meeting prevalence/age/trust'
+    '5beb7efe-fd9a-4556-801d-275e5ffc04cc' = 'Block execution of potentially obfuscated scripts'
+    'd3e037e1-3eb8-44c8-a917-57927947596d' = 'Block JS/VBScript launching downloaded executables'
+    '3b576869-a4ec-4529-8536-b80a7769e899' = 'Block Office apps creating executable content'
+    '75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84' = 'Block Office apps injecting into other processes'
+    '26190899-1602-49e8-8b27-eb1d0a1ce869' = 'Block Office comms app creating child processes'
+    'd1e49aac-8f56-4280-b9ba-993a6d77406c' = 'Block PSExec/WMI process creation'
+    '33ddedf1-c6e0-47cb-833e-de6133960387' = 'Block rebooting machine in Safe Mode'
+    'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 'Block untrusted/unsigned processes from USB'
+    'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'Block use of copied/impersonated system tools'
+    'a8f5898e-1dc8-49a9-9878-85004b8a61e6' = 'Block webshell creation for servers'
+    '92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b' = 'Block Win32 API calls from Office macros'
+    'c1db55ab-c21a-4637-bb3f-a12568109d35' = 'Use advanced ransomware protection'
   }
-  $enabled = @($prefs.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
-  if ($enabled.Count -eq 0) {
-    Add-Finding -Severity High -Category 'Hardening' -Title 'Defender ASR rules: NONE enabled' `
-      -Detail 'ASR blocks the exact techniques this tool detects (WMI persistence, LSASS abuse, Office child-process, USB payloads).' `
-      -Remediation 'Enable the full ASR rule set in block mode via GPO/Intune (AttackSurfaceReductionRules_Ids/Actions).'
+  # Pair each configured rule with its action (1=Block, 2=Audit, 6=Warn, 0/absent=Disabled).
+  # A rule present but in Audit/Warn does NOT block the technique, so it is not counted as enabled.
+  $ruleIds = @($prefs.AttackSurfaceReductionRules_Ids)
+  $ruleActions = @($prefs.AttackSurfaceReductionRules_Actions)
+  $blocking = New-Object System.Collections.Generic.List[string]
+  $auditing = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $ruleIds.Count; $i++) {
+    $id = "$($ruleIds[$i])".ToLower()
+    if (-not $id) { continue }
+    $act = if ($i -lt $ruleActions.Count) { [int]$ruleActions[$i] } else { 0 }
+    $label = if ($asrIds[$id]) { $asrIds[$id] } else { $id }
+    if ($act -eq 1) { $blocking.Add($label) }
+    elseif ($act -eq 2 -or $act -eq 6) { $auditing.Add($label) }
+  }
+  if ($blocking.Count -eq 0) {
+    Add-Finding -Severity High -Category 'Hardening' -Title ('Defender ASR rules: none in Block mode ({0} audit/warn)' -f $auditing.Count) `
+      -Detail 'ASR blocks the exact techniques this tool detects (WMI persistence, LSASS abuse, Office child-process, USB payloads). Audit/warn rules only log - they do not stop the technique.' `
+      -Remediation 'Enable the ASR rule set in Block mode via GPO/Intune (set AttackSurfaceReductionRules_Actions to 1, not 2/6).'
   }
   else {
-    Add-Finding -Severity Info -Category 'Hardening' -Title ("Defender ASR rules: {0} enabled" -f $enabled.Count) `
-      -Detail (($enabled | ForEach-Object { if ($asrIds["$_"]) { $asrIds["$_"] } else { $_ } }) -join ' | ')
+    Add-Finding -Severity Info -Category 'Hardening' -Title ("Defender ASR rules: {0} in Block mode" -f $blocking.Count) `
+      -Detail (($blocking -join ' | ') + $(if ($auditing.Count) { ' || audit/warn only: ' + ($auditing -join ', ') } else { '' }))
+  }
+  if ($blocking.Count -gt 0 -and $auditing.Count -gt 0) {
+    Add-Finding -Severity Low -Category 'Hardening' -Title ("{0} ASR rules are audit/warn only (not blocking)" -f $auditing.Count) `
+      -Detail ($auditing -join ', ') `
+      -Remediation 'Promote audited rules to Block once validated; audit mode logs the technique but allows it.'
   }
   # Controlled Folder Access
   $cfa = $prefs.EnableControlledFolderAccess
@@ -368,7 +396,7 @@ foreach ($rk in @(
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymousSAM'; Want = 1 },
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareWks'; Want = 0 },
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareServer'; Want = 0 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\RemoteRegistry'; Name = 'Start'; Want = 4 }
+  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry'; Name = 'Start'; Want = 4 }
 )) {
   $v = (Get-ItemProperty $rk.Key -Name $rk.Name -ErrorAction SilentlyContinue).($rk.Name)
   if ($null -ne $v -and [int]$v -ne [int]$rk.Want) {

@@ -1,6 +1,20 @@
+# Scan output - reports contain host-specific findings, never commit them
+WinHostPEAS_Output/
 BluePEAS_Output/
+*.json
+*.csv
+*.html
+*.enc
+
+# Logs and local test runs
 *.log
 testrun*/
 fc_test*/
-v2_test/
-v3_test/
+v*_test/
+elev*run*/
+localrun/
+verify/
+fullcheck/
+
+# Internal planning notes (host-specific, not part of the tool)
+.hermes/

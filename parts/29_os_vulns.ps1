@@ -78,17 +78,32 @@ if ($activeProtos.Count -gt 0) {
 
 # --- Cipher suites: weak/NULL/RC4/3DES presence in the enabled list ---
 try {
-  $cs = Get-TlsCipherSuite -ErrorAction Stop | Select-Object -ExpandProperty Name
-  $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
-  if ($weak.Count -gt 0) {
-    Add-Finding -Severity Medium -Category 'Crypto' -Title ("{0} weak cipher suites enabled" -f $weak.Count) `
-      -Detail (($weak | Select-Object -First 8) -join ', ') `
-      -Remediation 'Reorder/prune with Get-TlsCipherSuite | Disable-TlsCipherSuite; keep AEAD suites (GCM/ChaCha20).'
+  # Get-TlsCipherSuite must be collected into a variable BEFORE property access.
+  # Piping it straight into Select-Object -ExpandProperty Name fails with
+  # 'Property "Name" cannot be found' on the binary TLS module (both PS 5.1 and
+  # 7.x), yielding an empty list that was then reported as the false-clean
+  # "0 cipher suites enabled, none weak" while weak NULL suites were live.
+  $suites = @(Get-TlsCipherSuite -ErrorAction Stop)
+  $cs = @($suites | ForEach-Object { $_.Name } | Where-Object { $_ })
+  if ($cs.Count -eq 0) {
+    Add-Finding -Severity Info -Category 'Crypto' -Title 'Cipher suite list not assessed' `
+      -Detail 'Get-TlsCipherSuite returned no readable suite names; weak-cipher status is unknown, not clean.'
   }
   else {
-    Add-Finding -Severity Info -Category 'Crypto' -Title ("{0} cipher suites enabled, none weak" -f $cs.Count)
+    $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
+    if ($weak.Count -gt 0) {
+      Add-Finding -Severity Medium -Category 'Crypto' -Title ("{0} of {1} enabled cipher suites are weak" -f $weak.Count, $cs.Count) `
+        -Detail (($weak | Select-Object -First 8) -join ', ') `
+        -Remediation 'Prune with Disable-TlsCipherSuite -Name <suite>; keep AEAD suites (GCM/ChaCha20) only.'
+    }
+    else {
+      Add-Finding -Severity Info -Category 'Crypto' -Title ("{0} cipher suites enabled, none weak" -f $cs.Count)
+    }
   }
-} catch { }
+} catch {
+  Add-Finding -Severity Info -Category 'Crypto' -Title 'Cipher suite enumeration failed' `
+    -Detail ('Get-TlsCipherSuite error: ' + $_.Exception.Message + '. Weak-cipher status not assessed.')
+}
 
 # --- FIPS mode ---
 $fips = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsPolicyGroup' -ErrorAction SilentlyContinue).Enabled
@@ -161,8 +176,13 @@ foreach ($runtimeVer in @('v2.0.50727', 'v4.0.30319')) {
 }
 
 # --- Local security policy dump (secedit) - password/lockout baseline ---
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'OS' -Title 'Local security policy (secedit) not assessed (needs elevation)' `
+    -Detail 'secedit /export requires administrator; run elevated to verify minimum password length, account-lockout threshold and anonymous-lookup policy.'
+}
+elseif ($true) {
 try {
-  $secOut = "$env:TEMP\bluepeas_secedit.cfg"
+  $secOut = "$env:TEMP\winhostpeas_secedit.cfg"
   secedit /export /cfg $secOut /quiet 2>$null | Out-Null
   if (Test-Path $secOut) {
     $sec = Get-Content $secOut -ErrorAction SilentlyContinue
@@ -192,6 +212,7 @@ try {
     Remove-Item $secOut -Force -ErrorAction SilentlyContinue
   }
 } catch { }
+}
 
 # --- RDP encryption level (Terminal Server) ---
 $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
@@ -206,18 +227,24 @@ if ($ts) {
 }
 
 # --- Unsigned driver / test-signing exposure ---
-$bcdTest = $null
-try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
-if ($bcdTest) {
-  Add-Finding -Severity High -Category 'OS' -Title 'Test signing mode enabled (bcdedit testsigning)' `
-    -Detail 'Unsigned kernel drivers load freely - rootkit path.' `
-    -Remediation 'bcdedit /set testsigning off; investigate why it was on.'
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'OS' -Title 'Boot config (bcdedit) not assessed (needs elevation)' `
+    -Detail 'bcdedit /enum requires administrator; run elevated to detect test-signing mode and disabled code-integrity (nointegritychecks).'
 }
-$nointegritychecks = $null
-try { $nointegritychecks = (bcdedit /enum `{current`} 2>$null | Select-String 'nointegritychecks\s+Yes') } catch { }
-if ($nointegritychecks) {
-  Add-Finding -Severity High -Category 'OS' -Title 'Code-integrity checks disabled (nointegritychecks)' `
-    -Remediation 'bcdedit /set nointegritychecks on (restore) - disabled CI allows unsigned code at boot.'
+else {
+  $bcdTest = $null
+  try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
+  if ($bcdTest) {
+    Add-Finding -Severity High -Category 'OS' -Title 'Test signing mode enabled (bcdedit testsigning)' `
+      -Detail 'Unsigned kernel drivers load freely - rootkit path.' `
+      -Remediation 'bcdedit /set testsigning off; investigate why it was on.'
+  }
+  $nointegritychecks = $null
+  try { $nointegritychecks = (bcdedit /enum `{current`} 2>$null | Select-String 'nointegritychecks\s+Yes') } catch { }
+  if ($nointegritychecks) {
+    Add-Finding -Severity High -Category 'OS' -Title 'Code-integrity checks disabled (nointegritychecks)' `
+      -Remediation 'bcdedit /set nointegritychecks off (restores integrity enforcement); disabled CI allows unsigned code at boot.'
+  }
 }
 
 # --- Enabled local-admin RDP/WinRM exposure recap (ties into network findings) ---
