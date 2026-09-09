@@ -107,6 +107,16 @@ function Write-Reports {
     '  { sev: "' + $f.Severity + '", cat: "' + (& $esc $f.Category) + '", title: "' + (& $esc $f.Title) + '", detail: "' + (& $esc $f.Detail) + '", evid: "' + (& $esc $f.Evidence) + '", rem: "' + (& $esc $f.Remediation) + '" },'
   }
 
+  # Executive-summary placeholder values
+  $adminList = if ($script:Exec.Admins) { $script:Exec.Admins -join ', ' } else { '(none resolved)' }
+  $userRows = foreach ($u in $script:Exec.Users) {
+    $ll = if ($u.LastLogon) { $u.LastLogon.ToString('yyyy-MM-dd HH:mm') } else { '<span class="never">never</span>' }
+    $adm = if ($u.IsAdmin) { '<b class="adm">ADMIN</b>' } else { '' }
+    $en = if ($u.Enabled) { 'enabled' } else { '<span class="dis">disabled</span>' }
+    '<tr><td>' + $u.Name + '</td><td>' + $en + '</td><td>' + $adm + '</td><td>' + $ll + '</td></tr>'
+  }
+  $userRows = @('<tr><th>User</th><th>Status</th><th>Role</th><th>Last logon</th></tr>') + @($userRows)
+
   $htmlDoc = @"
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
@@ -137,13 +147,23 @@ function Write-Reports {
  .sev.Low{background:#0891b2}.sev.Info{background:#64748b}
  .rem{color:#0f766e}
  .count{color:#64748b;font-size:12px;margin:0 0 10px 2px}
+ .exec{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+ .exec-card{flex:1 1 380px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px 18px}
+ .exec-card h3{margin:0 0 8px;font-size:14px;color:#0f172a;text-transform:uppercase;letter-spacing:.5px}
+ table.kv{width:100%;border-collapse:collapse;font-size:13px}
+ table.kv td,table.kv th{border:1px solid #e5e7eb;padding:5px 8px;text-align:left}
+ table.kv tr td:first-child{color:#64748b;width:40%}
+ table.kv th{background:#f1f5f9}
+ .never{color:#b91c1c;font-weight:600}
+ .adm{color:#b91c1c}
+ .dis{color:#94a3b8}
 </style></head><body>
 <header>
  <h1>BlueWinPEAS Posture Audit &mdash; $($env:COMPUTERNAME)</h1>
  <div class="meta">Generated $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; $($meta.TotalFindings) findings &middot; highest severity: $($meta.HighestSeverity) &middot; FullCheck: $($meta.FullCheck)</div>
 </header>
 <div class="bar">
- <div class="tiles">`$tilesPlaceholder</div>
+<div class="tiles">`$tilesPlaceholder</div>
  <div class="controls">
    <input type="text" id="q" placeholder="Search findings..." oninput="render()">
    <select id="catSel" onchange="render()"><option value="">All categories</option>`$catOptsPlaceholder</select>
@@ -151,6 +171,25 @@ function Write-Reports {
  </div>
 </div>
 <main>
+ <div class="exec">
+  <div class="exec-card">
+   <h3>Executive summary</h3>
+   <table class="kv">
+    <tr><td>Local admins</td><td><b>$($script:Exec.AdminCount)</b> &mdash; `$adminListPlaceholder</td></tr>
+    <tr><td>Local users</td><td><b>$($script:Exec.UserCount)</b> ($($script:Exec.EnabledCount) enabled, $($script:Exec.DisabledCount) disabled, $($script:Exec.NeverLoggedIn) enabled-but-never-logged-on)</td></tr>
+    <tr><td>Persistence findings (Crit/High)</td><td><b>$($script:Exec.PersistCritHigh)</b></td></tr>
+    <tr><td>Priv-esc findings (Crit/High)</td><td><b>$($script:Exec.PrivEscCritHigh)</b></td></tr>
+    <tr><td>Hardening gaps (Crit/High/Med)</td><td><b>$($script:Exec.HardeningGaps)</b></td></tr>
+    <tr><td>Exposed secrets (Crit/High)</td><td><b>$($script:Exec.SecretsExposed)</b></td></tr>
+    <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (active ICMP sweep + TCP banner grab)</td></tr>
+    <tr><td>Scan mode</td><td>Local host checks <b>passive</b>; network discovery <b>active</b> (ICMP + TCP connect only)</td></tr>
+   </table>
+  </div>
+  <div class="exec-card">
+   <h3>Local accounts &mdash; last logon</h3>
+   <table class="kv" id="usersTable">`$userRowsPlaceholder</table>
+  </div>
+ </div>
  <p class="count" id="count"></p>
  <table id="tbl"><thead><tr><th style="width:70px">Severity</th><th style="width:130px">Category</th><th>Finding</th><th>Detail / Evidence</th><th style="width:28%">Remediation</th></tr></thead><tbody id="tbody"></tbody></table>
 </main>
@@ -183,6 +222,8 @@ render();
 </script>
 </body></html>
 "@
+  $htmlDoc = $htmlDoc.Replace('$adminListPlaceholder', $adminList)
+  $htmlDoc = $htmlDoc.Replace('$userRowsPlaceholder', ($userRows -join "`n"))
   $htmlDoc = $htmlDoc.Replace('$tilesPlaceholder', ($tiles -join ''))
   $htmlDoc = $htmlDoc.Replace('$catOptsPlaceholder', ($catOpts -join ''))
   $htmlDoc = $htmlDoc.Replace('$rowsJsPlaceholder', ($rowsJs -join "`n"))
