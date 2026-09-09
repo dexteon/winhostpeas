@@ -65,4 +65,4 @@ $script:Exec.PersistCritHigh = @($script:Findings | Where-Object { $_.Category -
 $script:Exec.PrivEscCritHigh = @($script:Findings | Where-Object { $_.Category -eq 'PrivEsc' -and $_.Severity -in 'Critical', 'High' }).Count
 $script:Exec.HardeningGaps = @($script:Findings | Where-Object { $_.Category -eq 'Hardening' -and $_.Severity -in 'Critical', 'High', 'Medium' }).Count
 $script:Exec.SecretsExposed = @($script:Findings | Where-Object { $_.Category -match 'Exposed secret|Credentials' -and $_.Severity -in 'Critical', 'High' }).Count
-$script:Exec.DevicesSeen = @($script:Findings | Where-Object { $_.Title -like 'Reachable device*' }).Count
+$script:Exec.DevicesSeen = @($script:Findings | Where-Object { $_.Title -like '*devices in ARP/neighbor cache*' }).Count

@@ -181,8 +181,8 @@ function Write-Reports {
     <tr><td>Priv-esc findings (Crit/High)</td><td><b>$($script:Exec.PrivEscCritHigh)</b></td></tr>
     <tr><td>Hardening gaps (Crit/High/Med)</td><td><b>$($script:Exec.HardeningGaps)</b></td></tr>
     <tr><td>Exposed secrets (Crit/High)</td><td><b>$($script:Exec.SecretsExposed)</b></td></tr>
-    <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (active ICMP sweep + TCP banner grab)</td></tr>
-    <tr><td>Scan mode</td><td>Local host checks <b>passive</b>; network discovery <b>active</b> (ICMP + TCP connect only)</td></tr>
+    <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (passive ARP/neighbor cache - no packets sent)</td></tr>
+    <tr><td>Scan mode</td><td>Fully passive - local checks and network visibility read local state only, no packets sent to other hosts</td></tr>
    </table>
   </div>
   <div class="exec-card">
