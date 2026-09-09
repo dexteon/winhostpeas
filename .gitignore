@@ -4,7 +4,6 @@ BluePEAS_Output/
 *.json
 *.csv
 *.html
-*.enc
 
 # Logs and local test runs
 *.log

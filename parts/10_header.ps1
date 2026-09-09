@@ -27,8 +27,7 @@ param(
   [string]$OutputDir = '.\WinHostPEAS_Output',
   [switch]$NoReport,
   [switch]$NoLaunch,
-  [switch]$Obfuscate,
-  [string]$EncryptKey
+  [switch]$Obfuscate
 )
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
