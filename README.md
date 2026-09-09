@@ -95,6 +95,14 @@ Full read-only IIS inventory via Microsoft.Web.Administration: sites + bindings 
 ### 14. OS vulnerability / crypto surface
 OS build + end-of-support table (Server 2008–2025, Win10/11) with EOL = Critical and <1-year = Medium; Windows 11 feature-update currency (24H2=26100). TLS protocol inventory from SCHANNEL (SSLv2/3, TLS 1.0/1.1 active = High; TLS 1.2/1.3 presence confirmed), enabled cipher-suite audit (NULL/RC4/3DES = Medium), FIPS status. SMBv1 (Critical) + SMB signing server/client. .NET Framework version (pre-4.7 = Medium), legacy v2/v3.x runtimes, SchUseStrongCrypto machine.config gap. Legacy optional features (PowerShellv2, Telnet/TFTP clients, SMB1, NetFx3). secedit policy baseline: password minimum length, lockout threshold, anonymous SAM lookup. RDP encryption level + SecurityLayer. bcdedit testsigning/nointegritychecks (unsigned driver = rootkit path, High).
 
+### 15. Persistence deep-dive
+The stealthier persistence slots beyond autoruns/startup/tasks: **Winlogon hijacks** (Shell/Userinit/Taskman/System replacements — Critical), **WMI permanent event subscriptions** (ActiveScript/CommandLine consumers — fileless SYSTEM persistence), **per-user COM hijack surface** (HKCU CLSID overrides with servers outside Windows/Program Files — invisible to per-machine audits), **IFEO Debuggers** + GlobalFlag/SilentProcessExit monitors (arbitrary-code-launch primitives), **AppInit_DLLs** (global DLL injection), **non-standard LSA Security/Notification Packages** (LSASS-loaded DLLs — mimikatz territory, Critical), **Active Setup StubPaths** in user-writable paths (executes for every new user), **netsh helper DLLs** outside standard paths, screensaver hijacks. Each finding carries a clean-image baseline comparison instruction.
+
+### 16. Image hardening baseline (the switch-to-flip list)
+Built for the golden-image goal — every check reports current state + the exact image change: **Defender ASR rules** (none enabled = High; ASR blocks the very techniques this tool detects, incl. the WMI-persistence rule), **Controlled Folder Access** (ransomware guard), **Defender network protection** (C2 callback kill) and **cloud-delivered protection**; **Exploit Protection** (DEP, mandatory ASLR/ForceRelocateImages, CFG); **AppLocker / WDAC application control** — absent policy = High, flagged as the single highest-value hardening control for an image; SmartScreen; **UAC consent levels** (silent-elevate = High); Guest account; removable features to strip from the image (Telnet/TFTP/PowerShellv2/SMB1); local admin count trim; null-session/remote-registry hardening (RestrictAnonymous, RestrictAnonymousSAM, RemoteRegistry start, AutoShareWks/Server default-share kill).
+
+**Hardening workflow for the image:** run BlueWinPEAS on the golden image → filter findings to Category = `Hardening` → each Remediation line is a build change (GPO/registry/Defender preference). Run again after each change to verify; exit code drops as the image hardens. Persistence/privesc categories double as regression tests — a hardened image should return zero Critical/High in `Persistence`, `PrivEsc`, and `Hardening` before rollout.
+
 ## Unattended fleet deployment
 
 1. Copy `BlueWinPEAS.ps1` to a share or push via your deployment tool.
@@ -112,7 +120,7 @@ parts/          source modules in execution order (10_header ... 99_summary)
                 cat parts/*.ps1 in filename order == BlueWinPEAS.ps1
 ```
 
-Edit `parts/`, reassemble with `cat parts/10_header.ps1 parts/11_findings.ps1 parts/12_helpers.ps1 parts/03_adfuncs.ps1 parts/13_secrets.ps1 parts/20_system.ps1 parts/21_creds.ps1 parts/22_privesc.ps1 parts/23_network.ps1 parts/24_ad_software.ps1 parts/25_ot_discovery.ps1 parts/26_service_inventory.ps1 parts/27_loopback.ps1 parts/28_iis.ps1 parts/29_os_vulns.ps1 parts/99_summary.ps1 > BlueWinPEAS.ps1`.
+Edit `parts/`, reassemble with `cat parts/10_header.ps1 parts/11_findings.ps1 parts/12_helpers.ps1 parts/03_adfuncs.ps1 parts/13_secrets.ps1 parts/20_system.ps1 parts/21_creds.ps1 parts/22_privesc.ps1 parts/23_network.ps1 parts/24_ad_software.ps1 parts/25_ot_discovery.ps1 parts/26_service_inventory.ps1 parts/27_loopback.ps1 parts/28_iis.ps1 parts/29_os_vulns.ps1 parts/30_hardening.ps1 parts/99_summary.ps1 > BlueWinPEAS.ps1`.
 
 ## Extending
 
