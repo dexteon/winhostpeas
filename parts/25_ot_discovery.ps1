@@ -1,13 +1,18 @@
 
 ######################## NETWORK: PASSIVE-ONLY DEVICE VISIBILITY ########################
 # No packets are sent to other hosts. Reads local state only:
-# ARP/neighbor cache, routing table, and established connections - the same
-# information an on-host attacker would see without touching the network.
+# ARP/neighbor cache on PHYSICAL adapters, and established connections.
 
 Start-Section 'NETWORK VISIBILITY (PASSIVE ONLY - NO PACKETS SENT)'
 
+$virtualIf = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+  $_.InterfaceDescription -match 'Virtual|Hyper-V|VMware|VirtualBox|WSL|Loopback|TAP|Tunnel|WireGuard|Bluestacks|Removable|Microsoft KM-TEST'
+} | Select-Object -ExpandProperty ifIndex -ErrorAction SilentlyContinue
+
 $neighbors = @(Get-NetNeighbor -ErrorAction SilentlyContinue | Where-Object {
-  $_.IPAddress -notmatch '^(127\.|::1|224\.|239\.|ff)' -and $_.LinkLayerAddress
+  $_.IPAddress -notmatch '^(127\.|::1|224\.|239\.|ff|169\.254|255\.)' -and
+  $_.LinkLayerAddress -and $_.LinkLayerAddress -ne '00-00-00-00-00-00' -and
+  ($virtualIf -notcontains $_.ifIndex)
 })
 $arpMap = @{}
 foreach ($n in $neighbors) { $arpMap[$n.IPAddress] = $n.LinkLayerAddress }
@@ -31,12 +36,12 @@ function Get-OuiVendor([string]$Mac) {
   return ''
 }
 
-Add-Finding -Severity Info -Category 'Discovery' -Title ('{0} devices in ARP/neighbor cache (passive read)' -f $neighbors.Count) `
+Add-Finding -Severity Info -Category 'Discovery' -Title ('{0} devices in ARP/neighbor cache (passive read, physical adapters only)' -f $neighbors.Count) `
   -Detail (($neighbors | Sort-Object IPAddress | ForEach-Object {
       $v = Get-OuiVendor $_.LinkLayerAddress
       '{0} -> {1} ({2}){3}' -f $_.IPAddress, $_.LinkLayerAddress, $_.State, $(if ($v) { ' [' + $v + ']' })
     }) -join ' | ') `
-  -Remediation 'Baseline this list; new MACs in the BMS zone = investigate (unauthorized device).'
+  -Remediation 'Baseline this list; new MACs in the BMS zone = investigate (unauthorized device). Virtual adapters (WSL/VMware/Hyper-V) and APIPA/broadcast entries are excluded.'
 
 foreach ($n in ($neighbors | Where-Object { $_.State -eq 'Reachable' -or $_.State -eq 'Stale' })) {
   $vendor = Get-OuiVendor $n.LinkLayerAddress
