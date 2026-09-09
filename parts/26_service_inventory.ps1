@@ -1,31 +1,5 @@
 
 ######################## SERVICE & VERSION INVENTORY ########################
-# Service inventory + banner grab on already-open ports. TCP connect + a short
-# generic read; NO exploit payloads, NO ICS protocol probes (OT safe).
-# Banner sections in < > are truncated to 60 chars; full content stays in the
-# console transcript only if you run with -VerboseBanners.
-
-function Get-ServiceBanner {
-  param([string]$Ip, [int]$Port, [int]$TimeoutMs = 1200, [int]$BannerLen = 128)
-  $entry = $null
-  try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect($Ip, $Port, $null, $null)
-    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); return $null }
-    $client.EndConnect($iar)
-    $stream = $client.GetStream()
-    $stream.ReadTimeout = $TimeoutMs
-    $buf = New-Object byte[] $BannerLen
-    $n = 0
-    try { $n = $stream.Read($buf, 0, $BannerLen) } catch { $n = 0 }
-    $client.Close()
-    if ($n -gt 0) {
-      $txt = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-      return ($txt -replace '[^\x20-\x7E]', '.')    # printable only
-    }
-    return ''
-  } catch { return $null }
-}
 
 Start-Section 'SERVICE INVENTORY (listening ports + banners)'
 
@@ -73,30 +47,6 @@ if ($localOt.Count -gt 0) {
   Add-Finding -Severity Medium -Category 'OT Services' -Title ('BMS/OT protocol listeners on this host: {0}' -f $localOt.Count) `
     -Detail (($localOt | ForEach-Object { '{0} ({1}) <- {2}' -f $_.Port, $_.Name, $_.Process }) -join ' | ') `
     -Remediation 'These are the crown jewels: enumerate owning software, version, and ensure zone firewall restricts who can reach them (IEC 62443 SR 5.1).'
-}
-
-# Banner grab against discovered neighbors (ICMP-alive devices from sweep)
-$grabTargets = @($script:Findings | Where-Object { $_.Category -eq 'Discovery' -and $_.Title -like 'Reachable device*' })
-$bannerPorts = @(80, 443, 8080, 8443, 4840, 502, 47808, 44818, 5900, 3389, 22, 23)
-if ($grabTargets.Count -gt 0) {
-  Write-Host ('  Banner-grabbing {0} discovered devices (12 common ports, 1.2s timeout each)...' -f $grabTargets.Count) -ForegroundColor DarkGray
-  $grabbed = 0
-  foreach ($t in $grabTargets) {
-    $ip = ($t.Title -replace 'Reachable device: ', '')
-    foreach ($port in $bannerPorts) {
-      $b = Get-ServiceBanner -Ip $ip -Port $port
-      if ($null -ne $b) {
-        $svc = $portMap[$port]; if (-not $svc) { $svc = 'unknown' }
-        $bTrim = if ($b.Length -gt 60) { $b.Substring(0, 60) + '...' } else { $b }
-        Add-Finding -Severity Info -Category 'Services' -Title ("{0}:{1} open ({2})" -f $ip, $port, $svc) `
-          -Detail $(if ($b) { 'Banner: ' + $bTrim } else { 'No banner (connect-only)' }) `
-          -Remediation 'Record service+version in the CMDB; version pinning enables CVE watchlisting.'
-        $grabbed++
-        if ($grabbed -ge 60) { break }
-      }
-    }
-    if ($grabbed -ge 60) { Write-Host '  Banner cap (60) reached.' -ForegroundColor DarkGray; break }
-  }
 }
 
 # Installed BMS/OT vendor software on this host

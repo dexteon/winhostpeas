@@ -1,24 +1,4 @@
-<#
-.SYNOPSIS
-  BlueWinPEAS - the winPEAS.ps1 enumeration engine refit as a BLUE TEAM posture audit.
-.DESCRIPTION
-  Same detection surface an attacker would enumerate, repurposed for defenders:
-    - structured findings (Severity / Category / Title / Detail / Remediation)
-    - secret VALUES are detected but redacted - never printed or written to reports
-    - added defender-side checks: Defender status, PowerShell logging coverage,
-      SMBv1/signing, LLMNR/NBT-NS, RDP NLA, BitLocker, LSA/CredGuard, password
-      policy, local account hygiene, dangerous token privileges
-    - machine-wide regex sweeps (registry/files) are opt-in (-FullCheck) and scoped
-    - emits JSON + CSV + HTML reports for ticketing / compliance pipelines
-  Read-only: changes nothing on the host. Produces no exploit instructions.
-.EXAMPLE
-  .\BlueWinPEAS.ps1                     # fast posture audit + reports
-  .\BlueWinPEAS.ps1 -FullCheck          # + deep (redacted) secret-pattern sweep
-  .\BlueWinPEAS.ps1 -OutputDir C:\Audits -TimeStamp
-.NOTES
-  Derived from winPEAS.ps1 v1.3 (PEASS-ng / @RandolphConley), defensive refit.
-  Run only on systems you own or are explicitly authorized to audit.
-#>
+
 
 [CmdletBinding()]
 param(
@@ -35,16 +15,10 @@ function TimeElapsed {
   if ($TimeStamp) { Write-Host ('  [{0:mm\:ss}]' -f $stopwatch.Elapsed) -ForegroundColor DarkGray }
 }
 
-######################## FINDINGS ENGINE ########################
-# Every check records a finding instead of printing exploit guidance.
-# Severities: Critical / High / Medium / Low / Info
-# Values that look like secrets are detected but REDACTED in every output lane.
-
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:FindingsByName = @{}
 
 function Get-Redacted {
-  # return length + fingerprint only, never the value
   param($Value)
   if ($null -eq $Value) { return $null }
   $s = [string]$Value
@@ -120,7 +94,6 @@ function Write-Reports {
   @{ Meta = $meta; Findings = $script:Findings } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
   $script:Findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 
-  # ---------- HTML dashboard ----------
   $sevOrder = 'Critical','High','Medium','Low','Info'
   $counts = @{}
   foreach ($s in $sevOrder) { $counts[$s] = @($script:Findings | Where-Object { $_.Severity -eq $s }).Count }
@@ -143,7 +116,6 @@ function Write-Reports {
     '  { sev: "' + $f.Severity + '", cat: "' + (& $esc $f.Category) + '", title: "' + (& $esc $f.Title) + '", detail: "' + (& $esc $f.Detail) + '", evid: "' + (& $esc $f.Evidence) + '", rem: "' + (& $esc $f.Remediation) + '" },'
   }
 
-  # Executive-summary placeholder values
   $adminList = if ($script:Exec.Admins) { $script:Exec.Admins -join ', ' } else { '(none resolved)' }
   $userRows = foreach ($u in $script:Exec.Users) {
     $ll = if ($u.LastLogon) { $u.LastLogon.ToString('yyyy-MM-dd HH:mm') } else { '<span class="never">never</span>' }
@@ -217,8 +189,8 @@ function Write-Reports {
     <tr><td>Priv-esc findings (Crit/High)</td><td><b>$($script:Exec.PrivEscCritHigh)</b></td></tr>
     <tr><td>Hardening gaps (Crit/High/Med)</td><td><b>$($script:Exec.HardeningGaps)</b></td></tr>
     <tr><td>Exposed secrets (Crit/High)</td><td><b>$($script:Exec.SecretsExposed)</b></td></tr>
-    <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (active ICMP sweep + TCP banner grab)</td></tr>
-    <tr><td>Scan mode</td><td>Local host checks <b>passive</b>; network discovery <b>active</b> (ICMP + TCP connect only)</td></tr>
+    <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (passive ARP/neighbor cache - no packets sent)</td></tr>
+    <tr><td>Scan mode</td><td>Fully passive - local checks and network visibility read local state only, no packets sent to other hosts</td></tr>
    </table>
   </div>
   <div class="exec-card">
@@ -271,7 +243,6 @@ render();
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
 
-  # Auto-launch the HTML report in the default browser (interactive runs).
   if ($LaunchHtml -and -not $NoLaunch) {
     try {
       $resolved = (Resolve-Path $html).Path
@@ -283,9 +254,6 @@ render();
     }
   }
 }
-
-######################## RETAINED HELPERS (defensive refit) ########################
-# ACL / SID / AD helper functions carried over from winPEAS.ps1 - unchanged logic.
 
 function Convert-SidToName {
   param($SidInput)
@@ -305,7 +273,6 @@ function Get-DomainContext {
   catch { return $null }
 }
 
-# ACL check refit: record weak service/path ACLs as findings instead of console hints.
 function Start-ACLCheck {
   param($Target, $ServiceName)
   if ($null -eq $Target) { return }
@@ -328,7 +295,6 @@ function Start-ACLCheck {
     }
     if ("$($Permission.RegistryRights)" -eq 'FullControl') { $userPermission = 'FullControl' }
     if ($userPermission) {
-      # filter benign: Users write on their own profile paths is by-design
       if ($Target -like "*$env:USERNAME*") { continue }
       Add-Finding -Severity High -Category 'Filesystem ACL' `
         -Title ("Non-admin identity has '{0}' on: {1}" -f $userPermission, $Target) `
@@ -338,7 +304,6 @@ function Start-ACLCheck {
       return
     }
   }
-  # world-writable check
   foreach ($ev in $everyoneLike) {
     $perm = $ACLObject.Access | Where-Object { $_.IdentityReference -like "*$ev*" -and $_.AccessControlType -eq 'Allow' }
     foreach ($p in $perm) {
@@ -614,12 +579,6 @@ function Get-AdcsSchannelInfo {
   return [pscustomobject]$info
 }
 
-######################## SECRET PATTERN LIBRARY (detection + redaction) ########################
-# The winPEAS regex corpus, kept for DETECTION only. Matched values are redacted
-# before they reach console or reports. Sweep is scoped to credential-bearing
-# locations and only runs with -FullCheck (machine-wide sweeps) or always-on
-# targeted checks (winlogon, unattend, PS history).
-
 function Get-SecretPatterns {
   $p = [ordered]@{}
   $p['Winlogon credential']        = '(?i)(DefaultPassword|AltDefaultPassword)\s*='
@@ -650,7 +609,6 @@ function Get-SecretPatterns {
 
 $script:SecretPatterns = Get-SecretPatterns
 
-# High-signal credential files an attacker (or malware) would target first.
 $script:SensitiveFileTargets = @(
   "$env:windir\Panther\Unattend.xml"
   "$env:windir\Panther\unattend.xml"
@@ -699,15 +657,12 @@ function Test-FileForSecrets {
   }
 }
 
-######################## SYSTEM & PATCH POSTURE ########################
-
 Start-Section 'SYSTEM INFORMATION'
 $os = Get-CimInstance Win32_OperatingSystem
 Add-Finding -Severity Info -Category 'System' -Title 'OS baseline' `
   -Detail ("{0} (build {1}) | installed {2:yyyy-MM-dd} | last boot {3:yyyy-MM-dd HH:mm} | {4} GB RAM" -f `
     $os.Caption, $os.BuildNumber, $os.InstallDate, $os.LastBootUpTime, [math]::Round($os.TotalVisibleMemorySize/1MB,1))
 
-# Patch recency (defenders care about exposure window, not KB-by-KB exploit mapping)
 $latestHF = Get-HotFix | Sort-Object InstalledOn -Descending -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($latestHF -and $latestHF.InstalledOn) {
   $age = (Get-Date) - $latestHF.InstalledOn
@@ -722,7 +677,6 @@ if ($latestHF -and $latestHF.InstalledOn) {
   }
 }
 
-# Reboot-pending (patch effectiveness)
 try {
   $pendingReboot = $false
   if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pendingReboot = $true }
@@ -734,8 +688,6 @@ try {
       -Remediation 'Schedule reboot maintenance window.'
   }
 } catch { }
-
-######################## DEFENDER / AV POSTURE (NEW) ########################
 
 Start-Section 'DEFENDER / AV POSTURE'
 try {
@@ -762,7 +714,6 @@ try {
   else {
     Add-Finding -Severity Medium -Category 'AV' -Title 'No record of a Defender quick scan' -Remediation 'Run a baseline scan and enable scheduled scanning.'
   }
-  # Exclusions = classic defense-evasion foothold
   $prefs = Get-MpPreference -ErrorAction SilentlyContinue
   $excl = @()
   if ($prefs) {
@@ -780,8 +731,6 @@ catch {
   Add-Finding -Severity Info -Category 'AV' -Title 'Defender status unavailable' -Detail 'Get-MpComputerStatus failed (non-Defender AV or older OS). Verify AV presence manually.'
 }
 
-######################## AUDITING & LOGGING POSTURE (NEW) ########################
-
 Start-Section 'AUDITING & LOGGING POSTURE'
 try {
   $auditPolicy = (auditpol.exe /get /category:* 2>$null | Where-Object { $_ -match '^\s' })
@@ -796,7 +745,6 @@ try {
   }
 } catch { }
 
-# Security log size + retention
 try {
   $secLog = Get-WinEvent -ListLog Security -ErrorAction Stop
   $mb = [math]::Round($secLog.MaximumSizeInBytes / 1MB, 0)
@@ -809,7 +757,6 @@ try {
   }
 } catch { }
 
-# WEF
 if (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager') {
   Add-Finding -Severity Info -Category 'Logging' -Title 'Windows Event Forwarding configured'
 }
@@ -819,7 +766,6 @@ else {
     -Remediation 'Deploy WEF or a log agent so security events reach a central SIEM.'
 }
 
-# PowerShell operational logging (blue-team staple)
 $psLogPaths = @(
   @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; Name = 'Script Block Logging' },
   @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging';     Name = 'Module Logging' },
@@ -838,11 +784,8 @@ foreach ($lp in $psLogPaths) {
   }
 }
 
-######################## CREDENTIAL EXPOSURE HARDENING ########################
-
 Start-Section 'CREDENTIAL EXPOSURE'
 
-# WDigest
 $wdigest = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -ErrorAction SilentlyContinue).UseLogonCredential
 if ($wdigest -eq 1) {
   Add-Finding -Severity High -Category 'Credentials' -Title 'WDigest storing plaintext credentials in LSASS' `
@@ -853,7 +796,6 @@ else {
   Add-Finding -Severity Info -Category 'Credentials' -Title 'WDigest plaintext storage disabled'
 }
 
-# LSA Protection (RunAsPPL)
 $runAsPPL = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -ErrorAction SilentlyContinue).RunAsPPL
 if ($runAsPPL -eq 1 -or $runAsPPL -eq 2) {
   Add-Finding -Severity Info -Category 'Credentials' -Title "LSA Protection enabled (RunAsPPL=$runAsPPL)"
@@ -863,7 +805,6 @@ else {
     -Remediation 'Enable RunAsPPL=1 via GPE: Computer Config > Admin Templates > System > Local Run As PPL.'
 }
 
-# Credential Guard
 $lsaCfg = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -ErrorAction SilentlyContinue).LsaCfgFlags
 if ($lsaCfg -eq 1 -or $lsaCfg -eq 2) {
   Add-Finding -Severity Info -Category 'Credentials' -Title "Credential Guard enabled (LsaCfgFlags=$lsaCfg)"
@@ -873,14 +814,12 @@ else {
     -Remediation 'Enable Credential Guard (hardware virtualization) to harden LSASS against dump-and-reuse.'
 }
 
-# Cached logons
 $cached = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue).CACHEDLOGONSCOUNT
 if ($null -ne $cached -and $cached -gt 4) {
   Add-Finding -Severity Low -Category 'Credentials' -Title "Cached domain logon count high ($cached)" `
     -Remediation 'Reduce CACHEDLOGONSCOUNT to <= 4 (MS baseline) to limit offline credential extraction.'
 }
 
-# Winlogon autologon / embedded creds - REDACTED
 $wlg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
 if ($wlg) {
   if ($wlg.AutoAdminLogon -eq 1) {
@@ -901,7 +840,6 @@ if ($wlg) {
   }
 }
 
-# RDCMan / saved RDP artifacts presence (risk indicators, no values read)
 if (Test-Path "$env:USERPROFILE\AppData\Local\Microsoft\Remote Desktop Connection Manager\RDCMan.settings") {
   Add-Finding -Severity Medium -Category 'Credentials' -Title 'RDCMan settings file present' `
     -Detail 'RDCMan .rdg files frequently contain decryptable stored credentials.' `
@@ -912,7 +850,7 @@ if ($rdpKey -and $rdpKey.MRU0) {
   Add-Finding -Severity Low -Category 'Credentials' -Title 'RDP connection history present' `
     -Detail ("Most recent target: {0}" -f $rdpKey.MRU0)
 }
-# PuTTY sessions with saved proxy passwords
+
 if (Test-Path 'HKCU:\SOFTWARE\SimonTatham\PuTTY\Sessions') {
   Get-ChildItem 'HKCU:\SOFTWARE\SimonTatham\PuTTY\Sessions' | ForEach-Object {
     $s = Get-ItemProperty $_.PSPath
@@ -923,19 +861,17 @@ if (Test-Path 'HKCU:\SOFTWARE\SimonTatham\PuTTY\Sessions') {
     }
   }
 }
-# OpenSSH agent keys registered
+
 if (Test-Path 'HKCU:\Software\OpenSSH\Agent\Keys') {
   $n = (Get-Item 'HKCU:\Software\OpenSSH\Agent\Keys').Property.Count
   Add-Finding -Severity Medium -Category 'Credentials' -Title "$n SSH key(s) registered in ssh-agent" `
     -Remediation 'Verify these are authorized; ssh-agent keys are extractable by SYSTEM-level code.'
 }
 
-# DPAPI protect folders present (normal, informational)
 foreach ($p in @("$env:USERPROFILE\AppData\Roaming\Microsoft\Protect", "$env:USERPROFILE\AppData\Local\Microsoft\Protect")) {
   if (Test-Path $p) { Add-Finding -Severity Info -Category 'Credentials' -Title "DPAPI master key store present ($p)" }
 }
 
-# Sensitive files: existence + targeted redacted scan
 foreach ($f in $script:SensitiveFileTargets) {
   if (Test-Path $f) {
     if ($f -match 'Unattend|sysprep|unattend') {
@@ -951,14 +887,12 @@ foreach ($f in $script:SensitiveFileTargets) {
   }
 }
 
-# Sticky notes database (plaintext credential risk)
 if (Test-Path "C:\Users\$env:USERNAME\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes*\LocalState\plum.sqlite") {
   Add-Finding -Severity Medium -Category 'Credentials' -Title 'Sticky Notes database present' `
     -Detail 'Sticky Notes frequently contain passwords in plaintext (plum.sqlite).' `
     -Remediation 'Educate users; consider disabling Sticky Notes on sensitive hosts.'
 }
 
-# PowerShell history credential usage - REDACTED, current user only
 $histPath = (Get-PSReadLineOption).HistorySavePath
 if (Test-Path $histPath) {
   $histHits = @()
@@ -979,7 +913,6 @@ if (Test-Path $histPath) {
   }
 }
 
-# Clipboard (presence only - do not print content)
 try {
   Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
   $cb = [Windows.Clipboard]::GetText()
@@ -998,11 +931,8 @@ try {
   }
 } catch { }
 
-######################## PRIVILEGE-ESCALATION SURFACE ########################
-
 Start-Section 'PRIVILEGE-ESCALATION SURFACE'
 
-# AlwaysInstallElevated
 foreach ($hive in 'HKLM', 'HKCU') {
   $aie = (Get-ItemProperty "${hive}:\SOFTWARE\Policies\Microsoft\Windows\Installer" -ErrorAction SilentlyContinue).AlwaysInstallElevated
   if ($aie -eq 1) {
@@ -1012,7 +942,6 @@ foreach ($hive in 'HKLM', 'HKCU') {
   }
 }
 
-# Unquoted service paths
 $services = Get-CimInstance Win32_Service | Where-Object {
   $_.PathName -inotmatch '"' -and $_.PathName -inotmatch ':\\Windows\\' -and $_.State -in @('Running', 'Stopped')
 }
@@ -1028,7 +957,6 @@ else {
   Add-Finding -Severity Info -Category 'PrivEsc' -Title 'No unquoted service paths outside Windows dirs'
 }
 
-# Weak ACLs on service binaries (attacker-writable = instant SYSTEM)
 Write-Host '  Scanning service binary ACLs (this takes a moment)...' -ForegroundColor DarkGray
 $UniqueServices = @{}
 Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -like '*.exe*' } | ForEach-Object {
@@ -1041,7 +969,6 @@ foreach ($h in $UniqueServices.GetEnumerator()) {
   Start-ACLCheck -Target $h.Name -ServiceName $h.Value
 }
 
-# Service registry key write access
 foreach ($svcKey in (Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\services' -ErrorAction SilentlyContinue | Select-Object -First 400)) {
   $target = $svcKey.Name.Replace('HKEY_LOCAL_MACHINE', 'hklm:')
   $acl = $null
@@ -1059,7 +986,6 @@ foreach ($svcKey in (Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\services' -Er
   }
 }
 
-# Startup folders
 foreach ($startup in @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
                        "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup")) {
   if (Test-Path $startup) {
@@ -1077,7 +1003,6 @@ foreach ($startup in @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\S
   }
 }
 
-# Run/RunOnce entries (persistence inventory)
 foreach ($rk in @('registry::HKLM\Software\Microsoft\Windows\CurrentVersion\Run',
                   'registry::HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce',
                   'registry::HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
@@ -1093,7 +1018,6 @@ foreach ($rk in @('registry::HKLM\Software\Microsoft\Windows\CurrentVersion\Run'
   }
 }
 
-# Scheduled tasks (non-Microsoft) - writable actions
 try {
   Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft*' } | ForEach-Object {
     $task = $_
@@ -1110,7 +1034,6 @@ try {
   }
 } catch { }
 
-# Dangerous token privileges held by the CURRENT user (what an attacker here could abuse)
 $privs = whoami.exe /all
 foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBackupPrivilege', 'SeRestorePrivilege',
                           'SeLoadDriverPrivilege', 'SeTakeOwnershipPrivilege', 'SeCreateTokenPrivilege', 'SeTcbPrivilege',
@@ -1122,7 +1045,6 @@ foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBacku
   }
 }
 
-# UAC
 $enableLUA = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue).EnableLUA
 if ($enableLUA -ne 1) {
   Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC disabled (EnableLUA != 1)' `
@@ -1132,7 +1054,6 @@ else {
   Add-Finding -Severity Info -Category 'PrivEsc' -Title 'UAC enabled'
 }
 
-# PrintNightmare-relevant PointAndPrint policy
 $pn = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint' -ErrorAction SilentlyContinue
 if ($pn) {
   if ($pn.RestrictDriverInstallationToAdministrators -eq 0 -and $pn.NoWarningNoElevationOnInstall -eq 1) {
@@ -1145,7 +1066,6 @@ else {
   Add-Finding -Severity Info -Category 'PrivEsc' -Title 'No PointAndPrint policy override (server default applies)'
 }
 
-# WSUS over HTTP
 $wu = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
 $wuServer = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue).WUServer
 if ($wu.UseWUServer -eq 1 -and $wuServer -match '^http://') {
@@ -1154,7 +1074,6 @@ if ($wu.UseWUServer -eq 1 -and $wuServer -match '^http://') {
     -Remediation 'Move WSUS to HTTPS with certificate pinning or enforce TLS.'
 }
 
-# SAM/SYSTEM backup copies lying around
 foreach ($samPath in @("$env:windir\repair\SAM", "$env:windir\System32\config\RegBack\SAM",
                        "$env:windir\repair\system", "$env:windir\System32\config\RegBack\system")) {
   if (Test-Path $samPath -ErrorAction SilentlyContinue) {
@@ -1164,11 +1083,8 @@ foreach ($samPath in @("$env:windir\repair\SAM", "$env:windir\System32\config\Re
   }
 }
 
-######################## NETWORK ATTACK SURFACE ########################
-
 Start-Section 'NETWORK ATTACK SURFACE'
 
-# SMBv1
 $smb1 = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
 if ($smb1 -and $smb1.EnableSMB1Protocol) {
   Add-Finding -Severity Critical -Category 'Network' -Title 'SMBv1 enabled' `
@@ -1179,7 +1095,6 @@ elseif ($smb1) {
   Add-Finding -Severity Info -Category 'Network' -Title 'SMBv1 disabled'
 }
 
-# SMB signing
 if ($smb1) {
   if (-not $smb1.RequireSecuritySignature) {
     Add-Finding -Severity Medium -Category 'Network' -Title 'SMB signing not required (server)' `
@@ -1191,7 +1106,6 @@ if ($smb1) {
   }
 }
 
-# LLMNR / NBT-NS (responder-style credential capture)
 try {
   $llmnr = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -ErrorAction SilentlyContinue).EnableMulticast
   if ($llmnr -eq 0) { Add-Finding -Severity Info -Category 'Network' -Title 'LLMNR disabled by policy' }
@@ -1217,7 +1131,6 @@ try {
   }
 } catch { }
 
-# RDP hardening
 $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
 $rdpEnabled = -not ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue).fDenyTSConnections -eq 1)
 if ($rdpEnabled) {
@@ -1235,7 +1148,6 @@ else {
   Add-Finding -Severity Info -Category 'Network' -Title 'RDP disabled'
 }
 
-# Defender firewall profiles
 try {
   foreach ($prof in (Get-NetFirewallProfile -ErrorAction Stop)) {
     if (-not $prof.Enabled) {
@@ -1247,7 +1159,6 @@ try {
 }
 catch { }
 
-# Listening ports inventory (exposure map, no exploit mapping)
 $ports = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
   Where-Object { $_.LocalAddress -notmatch '::1|127\.0\.0\.1' } |
   Select-Object LocalAddress, LocalPort, OwningProcess
@@ -1256,7 +1167,6 @@ if ($ports) {
   Add-Finding -Severity Info -Category 'Network' -Title ('{0} externally-listening TCP ports' -f $grouped.Count) `
     -Detail (($grouped | ForEach-Object { $_.Name }) -join ', ') `
     -Remediation 'Baseline expected services; investigate anything not in the standard build.'
-  # risky classics
   foreach ($risky in @{ 21 = 'FTP'; 23 = 'Telnet'; 69 = 'TFTP'; 445 = 'SMB'; 3389 = 'RDP'; 5985 = 'WinRM-HTTP'; 5986 = 'WinRM-HTTPS' }.GetEnumerator()) {
     if ($ports.LocalPort -contains [int]$risky.Key) {
       $sev = if ($risky.Key -in 23, 21) { 'High' } else { 'Low' }
@@ -1266,7 +1176,6 @@ if ($ports) {
   }
 }
 
-# Hosts file overrides (redirection tampering indicator)
 try {
   $hostsEntries = Get-Content "$env:windir\System32\drivers\etc\hosts" -ErrorAction Stop | Where-Object { $_ -match '^\s*[^#].+\s' }
   if ($hostsEntries.Count -gt 0) {
@@ -1276,13 +1185,11 @@ try {
   }
 } catch { }
 
-# WPAD proxy auto-detection
 $wpad = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp' -ErrorAction SilentlyContinue)
 $autoDetect = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue).AutoDetectProxySettings
 Add-Finding -Severity Info -Category 'Network' -Title 'WPAD status recorded' `
   -Detail ("HKCU AutoDetectProxySettings: {0} - if enabled, ensure WPAD is pinned/served only by trusted DHCP/DNS." -f $autoDetect)
 
-# SMB shares and broad access
 try {
   Get-SmbShare -ErrorAction Stop | ForEach-Object {
     $share = $_
@@ -1298,8 +1205,6 @@ try {
     }
   }
 } catch { }
-
-######################## LOCAL ACCOUNT HYGIENE ########################
 
 Start-Section 'LOCAL ACCOUNT HYGIENE'
 try {
@@ -1329,14 +1234,12 @@ try {
         -Remediation 'Rotate periodically or move to managed (LAPS) credentials.'
     }
   }
-  # local admin inventory
   $admins = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue
   Add-Finding -Severity Info -Category 'Accounts' -Title ('{0} local Administrators' -f @($admins).Count) `
     -Detail ((@($admins) | ForEach-Object { $_.Name }) -join ', ') `
     -Remediation 'Keep local admin membership minimal; prefer LAPS + just-in-time elevation.'
 } catch { }
 
-# LAPS presence
 $lapsOk = (Test-Path 'C:\Program Files\LAPS\CSE\Admpwd.dll') -or (Test-Path 'C:\Program Files (x86)\LAPS\CSE\Admpwd.dll') -or
   ((Get-ItemProperty 'HKLM:\Software\Policies\Microsoft Services\AdmPwd' -ErrorAction SilentlyContinue).AdmPwdEnabled -eq 1) -or
   (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS' -ErrorAction SilentlyContinue)
@@ -1349,10 +1252,8 @@ else {
     -Remediation 'Deploy Windows LAPS to randomize local admin passwords per host.'
 }
 
-# Currently logged-on sessions (incident context)
 try { $sessions = quser 2>$null; if ($sessions) { Add-Finding -Severity Info -Category 'Accounts' -Title 'Active sessions' -Detail (($sessions | Select-Object -Skip 1) -join ' | ') } } catch { }
 
-# BitLocker (data-at-rest)
 try {
   $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
   if ($bl.ProtectionStatus -eq 1) {
@@ -1366,16 +1267,11 @@ try {
   Add-Finding -Severity Info -Category 'Data' -Title 'BitLocker status unavailable on this volume'
 }
 
-# Screen lock policy (interactive attack surface)
 $lock = (Get-ItemProperty 'HKCU:\Control Panel\Desktop' -ErrorAction SilentlyContinue).InactivityTimeoutSecs
 if ($null -ne $lock -and [int]$lock -gt 900) {
   Add-Finding -Severity Low -Category 'Data' -Title "Screen lock timeout ${lock}s (>15 min)" `
     -Remediation 'Cap inactivity lock at 15 minutes or less via policy.'
 }
-
-######################## AD / DOMAIN MISCONFIG CHECKS ########################
-# Retained winPEAS AD functions, recast as findings (attacker-relevant abuse
-# paths reported as risk + fix, no exploitation guidance).
 
 Start-Section 'ACTIVE DIRECTORY / IDENTITY'
 $domainContext = Get-DomainContext
@@ -1385,7 +1281,6 @@ if (-not $domainContext) {
 else {
   Add-Finding -Severity Info -Category 'AD' -Title 'Domain-joined' -Detail ("Domain: {0}" -f $domainContext.Name)
 
-  # NTLM policy posture
   $ntlm = Get-NtlmPolicySummary
   if ($ntlm) {
     $lm = -1
@@ -1400,7 +1295,6 @@ else {
     }
   }
 
-  # Insecure dynamic DNS ACLs
   $dnsFindings = @(Get-WeakDnsUpdateFindings -DomainContext $domainContext)
   if ($dnsFindings.Count -gt 0) {
     foreach ($d in $dnsFindings) {
@@ -1410,7 +1304,6 @@ else {
     }
   }
 
-  # Kerberoastable privileged SPN accounts
   $spnFindings = @(Get-PrivilegedSpnTargets -DomainContext $domainContext)
   if ($spnFindings.Count -gt 0) {
     Add-Finding -Severity High -Category 'AD' -Title ('{0} privileged accounts with SPNs (Kerberoast targets)' -f $spnFindings.Count) `
@@ -1418,21 +1311,18 @@ else {
       -Remediation 'Remove SPNs from privileged accounts or set long (25+ char) passwords / use gMSA.'
   }
 
-  # gMSA readable by broad groups
   $gmsaReport = @(Get-GmsaReadersReport -DomainContext $domainContext)
   foreach ($g in ($gmsaReport | Where-Object { $_.WeakPrincipals -ne '' })) {
     Add-Finding -Severity Critical -Category 'AD' -Title ("gMSA '{0}' password readable by {1}" -f $g.Account, $g.WeakPrincipals) `
       -Remediation 'Restrict msDS-GroupMSAMembership to only the specific hosts/services that need it.'
   }
 
-  # ADCS Schannel UPN mapping (ESC10)
   $adcs = Get-AdcsSchannelInfo
   if ($adcs.MappingValue -ne $null -and $adcs.UpnMapping) {
     Add-Finding -Severity High -Category 'AD' -Title ('Schannel UPN certificate mapping enabled (ESC10 pattern, 0x{0:X})' -f [int]$adcs.MappingValue) `
       -Remediation 'Clear the 0x4 UPN-mapping bit from CertificateMappingMethods.'
   }
 
-  # Time skew (Kerberos health)
   $skew = Get-TimeSkewInfo -DomainContext $domainContext
   if ($skew -and [math]::Abs($skew.OffsetSeconds) -gt 300) {
     Add-Finding -Severity Medium -Category 'AD' -Title ('Kerberos time skew {0:N0}s vs PDC' -f $skew.OffsetSeconds) `
@@ -1441,14 +1331,11 @@ else {
   }
 }
 
-######################## INSTALLED SOFTWARE BASELINE ########################
-
 Start-Section 'INSTALLED SOFTWARE (baseline inventory)'
 try {
   $apps = @(Get-InstalledApplications)
   Add-Finding -Severity Info -Category 'Software' -Title ('{0} installed applications recorded' -f $apps.Count) `
     -Detail 'Full inventory in reports; diff against build baseline to catch unauthorized software.'
-  # flag ancient/unmaintained common-risk software by name
   $riskyNames = @('VNC', 'Telnet', 'WinSCP', 'FileZilla', 'uTorrent', 'TeamViewer')
   foreach ($r in $riskyNames) {
     $hit = $apps | Where-Object { $_.Software -match $r }
@@ -1460,14 +1347,11 @@ try {
   }
 } catch { }
 
-######################## FULLCHECK: SCOPED SECRET SWEEP ########################
-
 if ($FullCheck) {
   Start-Section 'DEEP SECRET-PATTERN SWEEP (-FullCheck; values redacted)'
   Write-Host '  Sweeping credential-bearing file locations and registry hives for secret patterns.' -ForegroundColor DarkGray
   Write-Host '  Matches are recorded REDACTED - no secret values are written to console or reports.' -ForegroundColor DarkGray
 
-  # Targeted dirs, not whole drives: user profile config areas + ProgramData
   $sweepDirs = @(
     "$env:USERPROFILE\.ssh"
     "$env:USERPROFILE\.aws"
@@ -1490,7 +1374,6 @@ if ($FullCheck) {
     } catch { }
   }
 
-  # Registry: winlogon + uninstall + services areas (not entire hives)
   $regTargets = @(
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
@@ -1520,20 +1403,14 @@ if ($FullCheck) {
   }
 }
 
-######################## NETWORK DISCOVERY: ARP, NEIGHBORS, DEVICES ########################
-# OT-safe: ARP table + neighbor cache (passive), ICMP-only ping sweep of local
-# subnets (no SYN/protocol probes at PLCs), MAC vendor OUI tagging (partial table).
+Start-Section 'NETWORK VISIBILITY (PASSIVE ONLY - NO PACKETS SENT)'
 
-Start-Section 'NETWORK DISCOVERY (ARP / NEIGHBOR TABLE)'
-
-# Passive snapshot first
 $neighbors = @(Get-NetNeighbor -ErrorAction SilentlyContinue | Where-Object {
   $_.IPAddress -notmatch '^(127\.|::1|224\.|239\.|ff)' -and $_.LinkLayerAddress
 })
 $arpMap = @{}
 foreach ($n in $neighbors) { $arpMap[$n.IPAddress] = $n.LinkLayerAddress }
 
-# Partial OUI table - extend as needed for your fleet
 $ouiMap = [ordered]@{
   '00-1B-1B' = 'Siemens AG';            '00-1D-9C' = 'Rockwell Automation'
   '00-00-0C' = 'Cisco';                  '00-50-56' = 'VMware'
@@ -1553,59 +1430,22 @@ function Get-OuiVendor([string]$Mac) {
   return ''
 }
 
-Add-Finding -Severity Info -Category 'Discovery' -Title ('{0} live ARP/neighbor entries (passive)' -f $neighbors.Count) `
-  -Detail (($neighbors | Sort-Object IPAddress | ForEach-Object { '{0} -> {1} ({2})' -f $_.IPAddress, $_.LinkLayerAddress, $_.State }) -join ' | ') `
+Add-Finding -Severity Info -Category 'Discovery' -Title ('{0} devices in ARP/neighbor cache (passive read)' -f $neighbors.Count) `
+  -Detail (($neighbors | Sort-Object IPAddress | ForEach-Object {
+      $v = Get-OuiVendor $_.LinkLayerAddress
+      '{0} -> {1} ({2}){3}' -f $_.IPAddress, $_.LinkLayerAddress, $_.State, $(if ($v) { ' [' + $v + ']' })
+    }) -join ' | ') `
   -Remediation 'Baseline this list; new MACs in the BMS zone = investigate (unauthorized device).'
 
-# ICMP-only sweep of directly connected IPv4 subnets (skip loopback/APIPA)
-$localIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
-  $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown'
-})
-$swept = @{}
-foreach ($ip in ($localIps | Select-Object -First 3)) {
-  $mask = $ip.PrefixLength
-  if ($mask -lt 8 -or $mask -gt 24) { continue }  # only sweep up to /24; wider = too slow/fragile
-  $base = ($ip.IPAddress.Split('.')[0..2] -join '.')
-  if ($swept.ContainsKey($base)) { continue }
-  $swept[$base] = $true
-  Write-Host "  ICMP sweep ${base}.0/24 (interface $($ip.InterfaceAlias))..." -ForegroundColor DarkGray
-  $pings = @{}
-  foreach ($i in 1..254) {
-    $tgt = "$base.$i"
-    try {
-      $p = New-Object System.Net.NetworkInformation.Ping
-      $pings[$tgt] = $p.SendPingAsync($tgt, 600)
-    } catch { }
+foreach ($n in ($neighbors | Where-Object { $_.State -eq 'Reachable' -or $_.State -eq 'Stale' })) {
+  $vendor = Get-OuiVendor $n.LinkLayerAddress
+  if ($vendor -match 'VMware|VirtualBox|QEMU|Hyper-V|Raspberry Pi') {
+    Add-Finding -Severity Medium -Category 'Discovery' -Title ("Virtualization MAC (${vendor}) seen nearby: {0}" -f $n.IPAddress) `
+      -Detail ('MAC {0} - unmanaged VMs/SBCs in an OT zone sit outside the controlled build baseline.' -f $n.LinkLayerAddress) `
+      -Remediation 'Confirm the device is authorized; remove or formally enroll it in the asset inventory.'
   }
-  try { [void][System.Threading.Tasks.Task]::WaitAll(@($pings.Values), 8000) } catch { }
-  $alive = @($pings.GetEnumerator() | Where-Object { $_.Value.Result.Status -eq 'Success' })
-  # refresh neighbor cache after sweep
-  Start-Sleep -Milliseconds 800
-  $post = @(Get-NetNeighbor -ErrorAction SilentlyContinue | Where-Object { $_.LinkLayerAddress })
-  $postMap = @{}
-  foreach ($n in $post) { $postMap[$n.IPAddress] = $n.LinkLayerAddress }
-  foreach ($a in $alive) {
-    $addr = $a.Key
-    $mac = if ($postMap[$addr]) { $postMap[$addr] } elseif ($arpMap[$addr]) { $arpMap[$addr] } else { '' }
-    $macClean = ($mac -replace '-', '-')
-    $vendor = Get-OuiVendor $macClean
-    $rtt = [math]::Round($a.Value.RoundtripTime, 0)
-    Add-Finding -Severity Info -Category 'Discovery' -Title ("Reachable device: {0}" -f $addr) `
-      -Detail ("MAC: {0}{1} | ICMP RTT {2}ms (ICMP-only; no protocol probes sent - OT safe)" -f `
-        $(if ($mac) { $mac } else { 'unknown' }), $(if ($vendor) { ' [' + $vendor + ']' } else { '' }), $rtt) `
-      -Remediation 'Compare against the authorized device inventory for this zone (IEC 62443 SR 6.2 asset inventory).'
-    if ($vendor -match 'VMware|VirtualBox|QEMU|Hyper-V|Raspberry Pi') {
-      Add-Finding -Severity Medium -Category 'Discovery' -Title ("Virtualization MAC (${vendor}) in BMS subnet: {0}" -f $addr) `
-        -Detail 'Unmanaged VMs/SBCs in an OT zone are outside the controlled build baseline.' `
-        -Remediation 'Confirm the device is authorized; remove or formally enroll it in the asset inventory.'
-    }
-  }
-}
-if ($swept.Count -eq 0) {
-  Add-Finding -Severity Info -Category 'Discovery' -Title 'No eligible /24-or-tighter IPv4 subnets to sweep (passive ARP data only)'
 }
 
-# Active conversations (who this host actually talks to) - exclude loopback
 $convs = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object {
   $_.RemoteAddress -notmatch '^(127\.|::1|0\.0\.0\.0|::$)'
 })
@@ -1617,37 +1457,8 @@ foreach ($r in $remotes) {
     -Detail ("Remote ports: $ports$(if ($mac) { ' | MAC ' + $mac })$(if ($vendor) { ' [' + $vendor + ']' })")
 }
 
-######################## SERVICE & VERSION INVENTORY ########################
-# Service inventory + banner grab on already-open ports. TCP connect + a short
-# generic read; NO exploit payloads, NO ICS protocol probes (OT safe).
-# Banner sections in < > are truncated to 60 chars; full content stays in the
-# console transcript only if you run with -VerboseBanners.
-
-function Get-ServiceBanner {
-  param([string]$Ip, [int]$Port, [int]$TimeoutMs = 1200, [int]$BannerLen = 128)
-  $entry = $null
-  try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect($Ip, $Port, $null, $null)
-    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); return $null }
-    $client.EndConnect($iar)
-    $stream = $client.GetStream()
-    $stream.ReadTimeout = $TimeoutMs
-    $buf = New-Object byte[] $BannerLen
-    $n = 0
-    try { $n = $stream.Read($buf, 0, $BannerLen) } catch { $n = 0 }
-    $client.Close()
-    if ($n -gt 0) {
-      $txt = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-      return ($txt -replace '[^\x20-\x7E]', '.')    # printable only
-    }
-    return ''
-  } catch { return $null }
-}
-
 Start-Section 'SERVICE INVENTORY (listening ports + banners)'
 
-# Standard IT services
 $portMap = @{
   21='FTP';22='SSH';23='Telnet';25='SMTP';53='DNS';67='DHCP';69='TFTP';80='HTTP';110='POP3';
   123='NTP';135='MSRPC';139='NetBIOS';143='IMAP';389='LDAP';443='HTTPS';445='SMB';465='SMTPS';
@@ -1663,10 +1474,10 @@ $portMap = @{
 
 $listen = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)
 $remoteListen = @()
-# Local listening services with owning process + version
+
 foreach ($c in $listen) {
   if ($c.LocalAddress -match '^127\.|^::1') {
-    continue   # counted in loopback section instead
+    continue   
   }
   $proc = $null
   try { $proc = Get-Process -Id $c.OwningProcess -ErrorAction Stop } catch { }
@@ -1684,7 +1495,6 @@ Add-Finding -Severity Info -Category 'Services' -Title ('{0} locally-listening T
     }) -join ' | ') `
   -Remediation 'Diff against the authorized service list per host role; close anything not required.'
 
-# BMS/OT-protocol ports listening locally = controllers/jace/hmi software on THIS host
 $otPorts = @(502, 4840, 4843, 47808, 44818, 20000, 5010, 1911, 4911, 9600, 41794, 41795, 137, 5353)
 $localOt = @($remoteListen | Where-Object { $otPorts -contains [int]$_.Port })
 if ($localOt.Count -gt 0) {
@@ -1693,31 +1503,6 @@ if ($localOt.Count -gt 0) {
     -Remediation 'These are the crown jewels: enumerate owning software, version, and ensure zone firewall restricts who can reach them (IEC 62443 SR 5.1).'
 }
 
-# Banner grab against discovered neighbors (ICMP-alive devices from sweep)
-$grabTargets = @($script:Findings | Where-Object { $_.Category -eq 'Discovery' -and $_.Title -like 'Reachable device*' })
-$bannerPorts = @(80, 443, 8080, 8443, 4840, 502, 47808, 44818, 5900, 3389, 22, 23)
-if ($grabTargets.Count -gt 0) {
-  Write-Host ('  Banner-grabbing {0} discovered devices (12 common ports, 1.2s timeout each)...' -f $grabTargets.Count) -ForegroundColor DarkGray
-  $grabbed = 0
-  foreach ($t in $grabTargets) {
-    $ip = ($t.Title -replace 'Reachable device: ', '')
-    foreach ($port in $bannerPorts) {
-      $b = Get-ServiceBanner -Ip $ip -Port $port
-      if ($null -ne $b) {
-        $svc = $portMap[$port]; if (-not $svc) { $svc = 'unknown' }
-        $bTrim = if ($b.Length -gt 60) { $b.Substring(0, 60) + '...' } else { $b }
-        Add-Finding -Severity Info -Category 'Services' -Title ("{0}:{1} open ({2})" -f $ip, $port, $svc) `
-          -Detail $(if ($b) { 'Banner: ' + $bTrim } else { 'No banner (connect-only)' }) `
-          -Remediation 'Record service+version in the CMDB; version pinning enables CVE watchlisting.'
-        $grabbed++
-        if ($grabbed -ge 60) { break }
-      }
-    }
-    if ($grabbed -ge 60) { Write-Host '  Banner cap (60) reached.' -ForegroundColor DarkGray; break }
-  }
-}
-
-# Installed BMS/OT vendor software on this host
 $otVendors = [ordered]@{
   'Niagara' = 'Tridium Niagara (JACE/supervisor)'
   'Honeywell' = 'Honeywell EBI/WebStation'
@@ -1751,14 +1536,8 @@ foreach ($v in $otVendors.GetEnumerator()) {
   }
 }
 
-######################## LOOPBACK / PORT-REDIRECTION DETECTION ########################
-# Detects: loopback-only listeners, loopback-bound conversations, port-proxy
-# (netsh portproxy) rules, SSH -L/-R tunnels via process cmdline, DNS-over-
-# loopback, and hosts-file loopback overrides (both 127.x and ::1).
-
 Start-Section 'LOOPBACK / TUNNEL DETECTION'
 
-# 1) Loopback-bound listeners (dedupe by port+process across IPv4/IPv6)
 $loListen = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object {
   $_.LocalAddress -match '^127\.|^::1$'
 })
@@ -1783,7 +1562,6 @@ else {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'No loopback-only TCP listeners'
 }
 
-# 2) Established conversations over loopback
 $loEst = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object {
   $_.LocalAddress -match '^127\.|^::1$' -and $_.RemoteAddress -match '^127\.|^::1$'
 })
@@ -1798,7 +1576,6 @@ if ($loGrouped.Count -eq 0) {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'No active loopback conversations'
 }
 
-# 3) netsh portproxy rules (classic tunnel/relay persistence)
 $portproxy = $null
 try { $portproxy = netsh interface portproxy show all 2>$null } catch { }
 $ppRules = @($portproxy | Where-Object { $_ -match '^\s*tcp\s|^tcpv6' })
@@ -1813,7 +1590,6 @@ else {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'No netsh portproxy rules'
 }
 
-# 4) SSH tunnel args in running processes
 try {
   $sshTunnels = Get-CimInstance Win32_Process -Filter "Name='ssh.exe' OR Name='plink.exe' OR Name='putty.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -match '\s-[LRD]\s|\s-D\s' }
@@ -1827,7 +1603,6 @@ try {
   if (-not $sshTunnels) { Add-Finding -Severity Info -Category 'Loopback' -Title 'No SSH/plink tunnel processes running' }
 } catch { }
 
-# 5) DNS-over-loopback (local resolver/proxy, incl. DoH clients)
 $loDns = @(Get-NetTCPConnection -State Listen, Established -ErrorAction SilentlyContinue | Where-Object {
   ($_.LocalPort -eq 53 -or $_.RemotePort -eq 53) -and ($_.LocalAddress -match '^127\.|^::1$' -or $_.RemoteAddress -match '^127\.|^::1$')
 })
@@ -1840,7 +1615,6 @@ else {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'No loopback DNS activity'
 }
 
-# 6) hosts-file loopback overrides (traffic silently redirected to self)
 try {
   $hostsLo = Get-Content "$env:windir\System32\drivers\etc\hosts" -ErrorAction Stop |
     Where-Object { $_ -match '^\s*(127\.|::1)\s' -and $_ -notmatch 'localhost' }
@@ -1855,17 +1629,10 @@ try {
   }
 } catch { }
 
-# 7) Loopback exclusions from proxy/inspection (attacker-evasion angle): check
-#    common localhost bypass settings only as Info
 $proxyOverride = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue).ProxyOverride
 if ($proxyOverride -match 'localhost|127\.') {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'Proxy bypass includes localhost (standard config)'
 }
-
-######################## IIS / WEB SERVER RECON ########################
-# Deep IIS inventory when IIS is present (Server 2019/Win11): sites, bindings,
-# app pools, certificates, web.config secrets, IIS Rewrite module, auth, TLS.
-# All checks are read-only (ServerManager API + config files).
 
 Start-Section 'IIS WEB SERVER RECON'
 $iisPresent = $false
@@ -1886,11 +1653,9 @@ else {
   Add-Finding -Severity Info -Category 'IIS' -Title 'IIS is installed' `
     -Detail 'Full web-server recon follows - every finding is attacker-recon surface.'
 
-  # --- IIS version ---
   $iisVer = (Get-Item "$env:windir\System32\inetsrv\w3wp.exe" -ErrorAction SilentlyContinue).VersionInfo.FileVersion
   if ($iisVer) { Add-Finding -Severity Info -Category 'IIS' -Title "IIS engine version $iisVer" }
 
-  # --- Sites & bindings ---
   if ($sm) {
     foreach ($site in $sm.Sites) {
       $bindings = ($site.Bindings | ForEach-Object {
@@ -1899,13 +1664,11 @@ else {
       Add-Finding -Severity Info -Category 'IIS' -Title ("Site '{0}' ({1})" -f $site.Name, $site.State) `
         -Detail ("Bindings: {0} | ID: {1}" -f $bindings, $site.Id) `
         -Remediation 'Baseline expected bindings; unknown sites = investigate.'
-      # HTTP-only site (no TLS binding)
       if (-not ($site.Bindings | Where-Object { $_.Protocol -eq 'https' })) {
         Add-Finding -Severity Medium -Category 'IIS' -Title ("Site '{0}' has NO HTTPS binding" -f $site.Name) `
           -Detail 'Cleartext HTTP - credentials/cookies/session tokens readable on the wire.' `
           -Remediation 'Add an HTTPS binding with a valid cert; redirect HTTP to HTTPS; set HSTS.'
       }
-      # Physical path + writability check
       foreach ($app in $site.Applications) {
         $root = $app.VirtualDirectories | Select-Object -First 1
         if ($root -and $root.PhysicalPath -and (Test-Path $root.PhysicalPath)) {
@@ -1925,7 +1688,6 @@ else {
       }
     }
 
-    # --- App pools ---
     foreach ($pool in $sm.ApplicationPools) {
       $ident = $pool.ProcessModel.IdentityType
       $flags = @()
@@ -1945,7 +1707,6 @@ else {
     }
   }
 
-  # --- Machine certificates: expiry / weak keys (covers HTTPS bindings) ---
   try {
     $now = Get-Date
     foreach ($cert in (Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue)) {
@@ -1968,7 +1729,6 @@ else {
     }
   } catch { }
 
-  # --- IIS URL Rewrite module ---
   $rewriteDll = "$env:windir\System32\inetsrv\rewrite.dll"
   if (Test-Path $rewriteDll) {
     $rv = (Get-Item $rewriteDll).VersionInfo
@@ -1982,13 +1742,11 @@ else {
         -Detail 'Older Rewrite 2.x builds have published security fixes (e.g. spoofing/info-disclosure class advisories).' `
         -Remediation 'Upgrade to the latest URL Rewrite 2.1 from Microsoft; verify against the advisory list.'
     }
-    # Rewrite rules referenced in web.configs get scanned below with the file sweep
   }
   else {
     Add-Finding -Severity Info -Category 'IIS' -Title 'IIS URL Rewrite module not installed'
   }
 
-  # --- web.config secrets & weak machineKey settings ---
   $webRoots = @("$env:windir\System32\inetsrv\config", "$env:SystemDrive\inetpub")
   if ($sm) {
     foreach ($site in $sm.Sites) {
@@ -2005,13 +1763,11 @@ else {
       $content = $null
       try { $content = Get-Content $cfg.FullName -Raw -ErrorAction SilentlyContinue } catch { }
       if (-not $content) { continue }
-      # connection strings with passwords (redacted)
       if ($content -match '(?i)connectionstring\s*=.{0,200}password\s*=') {
         Add-Finding -Severity High -Category 'IIS' -Title ("Plaintext DB password in {0}" -f $cfg.FullName) `
           -Detail 'Detected via pattern; value not recorded.' `
           -Remediation 'Move to encrypted connectionStrings sections or managed identities.'
       }
-      # machineKey weak/validation
       if ($content -match '(?i)<machinekey[^>]*validation\s*=\s*"(MD5|SHA1|3DES|AES"[^"]*"?)') {
         Add-Finding -Severity High -Category 'IIS' -Title ("Weak machineKey validation in {0}" -f $cfg.FullName) `
           -Detail 'MD5/SHA1/3DES ViewState signing is forgeable - ViewState deserialization RCE path.' `
@@ -2022,22 +1778,18 @@ else {
           -Detail 'Explicit short validationKey is brute-forceable, enabling ViewState forgery.' `
           -Remediation 'Use 64-128 hex byte autoGenerated keys.'
       }
-      # debug=true exposed
       if ($content -match '(?i)<deployment[^>]*retail\s*=\s*"false"') {
         Add-Finding -Severity Low -Category 'IIS' -Title ("deployment retail=false in {0}" -f $cfg.FullName) `
           -Remediation 'Set retail="true" on production servers (kills debug tracing + detailed errors).'
       }
-      # directory browsing on
       if ($content -match '(?i)<directorybrowse[^>]*enabled\s*=\s*"true"') {
         Add-Finding -Severity Medium -Category 'IIS' -Title ("Directory browsing enabled in {0}" -f $cfg.FullName) `
           -Remediation 'Disable directoryBrowse - leaks file inventory to attackers.'
       }
-      # generic secret patterns
       Test-FileForSecrets -Path $cfg.FullName -Context ' (IIS web.config)'
     }
   }
 
-  # --- Server-level auth config from applicationHost.config ---
   $appHost = "$env:windir\System32\inetsrv\config\applicationHost.config"
   if (Test-Path $appHost) {
     $ah = $null
@@ -2055,14 +1807,12 @@ else {
       if ($ah -match '(?i)<directoryBrowse[^>]*enabled\s*=\s*"true"') {
         Add-Finding -Severity Medium -Category 'IIS' -Title 'Directory browsing enabled at server level'
       }
-      # applicationHost.config itself: connection strings / passwords
       if ($ah -match '(?i)password\s*=') {
         Add-Finding -Severity High -Category 'IIS' -Title 'Password-shaped value in applicationHost.config' `
           -Detail 'App-pool/service credentials stored in config are readable by admins and backup-exfiltration.' `
           -Remediation 'Use app-pool identities where possible; protect config backups.'
       }
     }
-    # writable applicationHost.config = total IIS takeover
     $aclAh = Get-Acl $appHost -ErrorAction SilentlyContinue
     if ($aclAh) {
       $weakAh = $aclAh.Access | Where-Object {
@@ -2077,7 +1827,6 @@ else {
     }
   }
 
-  # --- Other web-adjacent services ---
   foreach ($svc in @(@('FTPSVC', 'IIS FTP'), @('SMTPSVC', 'IIS SMTP'))) {
     $s = Get-Service $svc[0] -ErrorAction SilentlyContinue
     if ($s -and $s.Status -eq 'Running') {
@@ -2087,7 +1836,6 @@ else {
   }
 }
 
-# --- WinRM transport security (IIS-adjacent remote mgmt) ---
 try {
   $listeners = Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop | Get-Item
   foreach ($l in $listeners) {
@@ -2115,14 +1863,8 @@ try {
   Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM not configured on this host'
 }
 
-######################## OS VULNERABILITY / CRYPTO / EOL SURFACE ########################
-# OS-level vulnerability surface for Server 2019/2022 and Win10/11:
-# OS EOL, TLS protocol inventory, cipher suites, SMB dialects, RDP encryption,
-# .NET/edge/legacy runtime inventory, LSA old behavior, secedit baseline dump.
-
 Start-Section 'OS VULNERABILITY SURFACE'
 
-# --- OS build + support status ---
 $osCim = Get-CimInstance Win32_OperatingSystem
 $osName = $osCim.Caption
 $build = [int]$osCim.BuildNumber
@@ -2153,13 +1895,12 @@ foreach ($e in $eolTable) {
     break
   }
 }
-# Win11 Pro build currency check (24H2 = 26100)
+
 if ($osName -like '*Windows 11*' -and $build -lt 26100) {
   Add-Finding -Severity Medium -Category 'OS' -Title ("Windows 11 build {0} is behind (24H2 = 26100)" -f $build) `
     -Remediation 'Old Win11 builds fall out of servicing faster; update to the current feature update.'
 }
 
-# --- TLS protocol inventory (SSP Schannel enabled protocols) ---
 foreach ($hive in @('HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols')) {
   $protos = @('SSL 2.0', 'SSL 3.0', 'TLS 1.0', 'TLS 1.1', 'TLS 1.2', 'TLS 1.3')
   foreach ($p in $protos) {
@@ -2168,7 +1909,6 @@ foreach ($hive in @('HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SC
     $disabled = (Get-ItemProperty $k -Name Enabled -ErrorAction SilentlyContinue).Enabled
     $active = if ($disabled -eq 0 -and $enabled -eq 1) { $true }
               elseif ($null -eq $disabled -and $null -eq $enabled) {
-                # OS defaults: TLS1.2/1.3 on; older off on modern builds
                 if ($p -in 'TLS 1.2', 'TLS 1.3' -and $build -ge 17763) { $true }
                 elseif ($p -in 'TLS 1.2', 'TLS 1.3') { $false } else { $false }
               } else { $false }
@@ -2192,7 +1932,6 @@ if ($activeProtos.Count -gt 0) {
     -Remediation 'Explicitly enable TLS 1.2/1.3 server-side.'
 }
 
-# --- Cipher suites: weak/NULL/RC4/3DES presence in the enabled list ---
 try {
   $cs = Get-TlsCipherSuite -ErrorAction Stop | Select-Object -ExpandProperty Name
   $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
@@ -2206,13 +1945,11 @@ try {
   }
 } catch { }
 
-# --- FIPS mode ---
 $fips = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsPolicyGroup' -ErrorAction SilentlyContinue).Enabled
 $fips2 = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name FipsAlgorithmPolicy -ErrorAction SilentlyContinue
 Add-Finding -Severity Info -Category 'Crypto' -Title 'FIPS policy status recorded' `
   -Detail ("FipsAlgorithmPolicy present: {0}" -f [bool]$fips2)
 
-# --- SMB client/server dialect floor ---
 try {
   $srv = Get-SmbServerConfiguration -ErrorAction Stop
   if ($srv.EnableSMB1Protocol) {
@@ -2230,7 +1967,6 @@ try {
   }
 } catch { }
 
-# --- .NET framework inventory + strong-crypto opt-in ---
 $releaseKey = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
 $netVer = if ($releaseKey) {
   if ($releaseKey -ge 533320) { '4.8.1+' } elseif ($releaseKey -ge 528040) { '4.8' }
@@ -2248,7 +1984,6 @@ foreach ($v2v35 in @('v2.0.50727', 'v3.0', 'v3.5')) {
   }
 }
 
-# --- Legacy/insecure optional features enabled ---
 try {
   $feats = Get-WindowsOptionalFeature -Online -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' -and $_.FeatureName -match 'PowerShellV2|SMB1Protocol|TelnetClient|TFTPClient|NetFx3|IIS-.*Basicauth' }
   foreach ($f in @($feats)) {
@@ -2258,7 +1993,6 @@ try {
   }
 } catch { }
 
-# --- Depreciated crypto in .NET machine.config (SchUseStrongCrypto) ---
 foreach ($runtimeVer in @('v2.0.50727', 'v4.0.30319')) {
   foreach ($bit in @('64', '32')) {
     $mc = "$env:windir\Microsoft.NET\Framework$($bit)\$runtimeVer\CONFIG\machine.config"
@@ -2276,7 +2010,6 @@ foreach ($runtimeVer in @('v2.0.50727', 'v4.0.30319')) {
   }
 }
 
-# --- Local security policy dump (secedit) - password/lockout baseline ---
 try {
   $secOut = "$env:TEMP\bluepeas_secedit.cfg"
   secedit /export /cfg $secOut /quiet 2>$null | Out-Null
@@ -2309,7 +2042,6 @@ try {
   }
 } catch { }
 
-# --- RDP encryption level (Terminal Server) ---
 $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
 if ($ts) {
   if ($ts.MinEncryptionLevel -lt 3) {
@@ -2321,7 +2053,6 @@ if ($ts) {
   }
 }
 
-# --- Unsigned driver / test-signing exposure ---
 $bcdTest = $null
 try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
 if ($bcdTest) {
@@ -2336,7 +2067,6 @@ if ($nointegritychecks) {
     -Remediation 'bcdedit /set nointegritychecks on (restore) - disabled CI allows unsigned code at boot.'
 }
 
-# --- Enabled local-admin RDP/WinRM exposure recap (ties into network findings) ---
 $nullDevice = $null
 try {
   $denyRdp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections
@@ -2345,15 +2075,8 @@ try {
   }
 } catch { }
 
-######################## PERSISTENCE DEEP-DIVE ########################
-# High-signal persistence locations beyond Run/RunOnce/startup/tasks:
-# Winlogon hijacks, WMI permanent subscriptions, COM hijack-prone HKCU CLSIDs,
-# IFEO debuggers, AppInit_DLLs, LSA security packages, Active Setup,
-# netsh helpers, screensaver hijacks, service failure actions.
-
 Start-Section 'PERSISTENCE DEEP-DIVE'
 
-# --- Winlogon hijack points ---
 $wlg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
 if ($wlg) {
   foreach ($val in @('Shell', 'Userinit', 'Taskman', 'System', 'VmApplet', 'AppSetup')) {
@@ -2374,7 +2097,6 @@ if ($wlg) {
   }
 }
 
-# --- WMI permanent event subscriptions (fileless persistence) ---
 try {
   $subs = @()
   foreach ($nsName in @('root\subscription', "root\cimv2")) {
@@ -2408,7 +2130,6 @@ try {
   }
 } catch { }
 
-# --- COM hijack-prone: HKCU CLSID (per-user COM overrides) ---
 try {
   $hkcuClsid = Get-ChildItem 'HKCU:\Software\Classes\CLSID' -ErrorAction SilentlyContinue
   $count = @($hkcuClsid).Count
@@ -2432,7 +2153,6 @@ try {
   }
 } catch { }
 
-# --- IFEO debuggers (arbitrary code exec launcher) ---
 try {
   $ifeoRoot = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
   $debuggers = Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue | ForEach-Object {
@@ -2449,7 +2169,6 @@ try {
   else {
     Add-Finding -Severity Info -Category 'Persistence' -Title 'No IFEO debugger keys'
   }
-  # IFEO GlobalFlag + SilentProcessExit (subtler variant)
   $spe = Get-ChildItem "$ifeoRoot" -ErrorAction SilentlyContinue | ForEach-Object {
     $g = Get-ItemProperty $_.PSPath -Name GlobalFlag -ErrorAction SilentlyContinue
     if ($g -and ($g.GlobalFlag -band 0x200)) {
@@ -2466,7 +2185,6 @@ try {
   }
 } catch { }
 
-# --- AppInit_DLLs (global DLL injection) ---
 $appInit = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows' -ErrorAction SilentlyContinue
 if ($appInit -and $appInit.AppInit_DLLs) {
   Add-Finding -Severity High -Category 'Persistence' -Title ("AppInit_DLLs set: {0}" -f $appInit.AppInit_DLLs) `
@@ -2477,7 +2195,6 @@ else {
   Add-Finding -Severity Info -Category 'Persistence' -Title 'AppInit_DLLs empty'
 }
 
-# --- LSA security packages / notification packages (DLL load at boot) ---
 $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
 foreach ($pkgName in @('Security Packages', 'Notification Packages')) {
   $pkgs = $lsa.$pkgName
@@ -2493,7 +2210,6 @@ foreach ($pkgName in @('Security Packages', 'Notification Packages')) {
   }
 }
 
-# --- Active Setup (per-user exec at first logon) ---
 try {
   foreach ($hive in @('HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components', 'HKCU:\SOFTWARE\Microsoft\Active Setup\Installed Components')) {
     Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
@@ -2511,7 +2227,6 @@ try {
   }
 } catch { }
 
-# --- netsh helpers ---
 try {
   $helpers = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Netsh' -ErrorAction SilentlyContinue | ForEach-Object {
     $p = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).'(default)'
@@ -2527,7 +2242,6 @@ try {
   if (@($helpers).Count -eq 0) { Add-Finding -Severity Info -Category 'Persistence' -Title 'No netsh helper DLLs registered' }
 } catch { }
 
-# --- Screensaver hijack (per-user, logon-session exec) ---
 foreach ($sidKey in @('HKCU:\Control Panel\Desktop')) {
   $ss = Get-ItemProperty $sidKey -ErrorAction SilentlyContinue
   if ($ss -and $ss.SCRNSAVE.EXE -and "$($ss.SCRNSAVE.EXE)" -notmatch '^C:\\Windows\\System32') {
@@ -2536,13 +2250,8 @@ foreach ($sidKey in @('HKCU:\Control Panel\Desktop')) {
   }
 }
 
-######################## IMAGE HARDENING BASELINE ########################
-# The switch-to-flip list: what the golden image should enforce. Each check
-# reports the current state + the exact hardening action.
-
 Start-Section 'IMAGE HARDENING BASELINE'
 
-# --- Defender ASR rules ---
 try {
   $prefs = Get-MpPreference -ErrorAction Stop
   $asrIds = @{
@@ -2571,27 +2280,23 @@ try {
     Add-Finding -Severity Info -Category 'Hardening' -Title ("Defender ASR rules: {0} enabled" -f $enabled.Count) `
       -Detail (($enabled | ForEach-Object { if ($asrIds["$_"]) { $asrIds["$_"] } else { $_ } }) -join ' | ')
   }
-  # Controlled Folder Access
   $cfa = $prefs.EnableControlledFolderAccess
   if ($cfa -eq 1) { Add-Finding -Severity Info -Category 'Hardening' -Title 'Controlled Folder Access (ransomware guard) ON' }
   else {
     Add-Finding -Severity Medium -Category 'Hardening' -Title 'Controlled Folder Access OFF' `
       -Remediation 'Enable in audit mode first, then block: Set-MpPreference -EnableControlledFolderAccess 1.'
   }
-  # Network protection
   if ($prefs.EnableNetworkProtection -eq 1) { Add-Finding -Severity Info -Category 'Hardening' -Title 'Defender network protection ON' }
   else {
     Add-Finding -Severity Medium -Category 'Hardening' -Title 'Defender network protection OFF' `
       -Remediation 'EnableNetworkProtection=1 blocks malicious domains at the filter driver (C2 callback kill).'
   }
-  # Cloud protection + sample submit
   if ($prefs.MAPSReporting -eq 0) {
     Add-Finding -Severity Medium -Category 'Hardening' -Title 'Defender cloud-delivered protection OFF' `
       -Remediation 'MAPSReporting=2 (advanced maps) - without cloud signals, zero-day behavior detection is blind.'
   }
 } catch { }
 
-# --- Exploit Protection (system-wide mitigations) ---
 try {
   $procMit = Get-ProcessMitigation -System -ErrorAction Stop
   $dep = "$($procMit.Dep.Policy)"
@@ -2623,7 +2328,6 @@ try {
   }
 } catch { }
 
-# --- AppLocker / WDAC policy presence ---
 $appLockerSvc = Get-Service AppIDSvc -ErrorAction SilentlyContinue
 $alRules = 0
 try {
@@ -2649,7 +2353,6 @@ else {
     -Remediation 'Golden-image item: deploy WDAC (audit -> enforce) or AppLocker baseline rules (EXE/DLL/Script/MSI). Single highest-value hardening control.'
 }
 
-# --- SmartScreen ---
 try {
   $ss = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name SmartScreenEnabled -ErrorAction SilentlyContinue
   $ssVal = "$($ss.SmartScreenEnabled)"
@@ -2665,7 +2368,6 @@ try {
   }
 } catch { }
 
-# --- UAC notification level (image default) ---
 $uacLevel = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
 $uacMap = @{ 0 = 'Elevate without prompting (no consent)'; 1 = 'Prompt for creds on secure desktop'; 2 = 'Prompt for consent on secure desktop'; 5 = 'Prompt for consent for non-Windows binaries (default)' }
 if ($null -ne $uacLevel) {
@@ -2679,7 +2381,6 @@ if ($null -ne $uacLevel) {
   }
 }
 
-# --- Guest account / local policies the image should lock ---
 try {
   $guest = Get-LocalUser -Name Guest -ErrorAction SilentlyContinue
   if ($guest -and $guest.Enabled) {
@@ -2689,7 +2390,6 @@ try {
   else { Add-Finding -Severity Info -Category 'Hardening' -Title 'Guest account disabled' }
 } catch { }
 
-# --- Remote desktop helpers image should remove ---
 foreach ($feature in @('TelnetClient', 'TFTPClient', 'MicrosoftWindowsPowerShellV2', 'SMB1Protocol')) {
   try {
     $f = Get-WindowsOptionalFeature -Online -FeatureName $feature -ErrorAction SilentlyContinue
@@ -2700,7 +2400,6 @@ foreach ($feature in @('TelnetClient', 'TFTPClient', 'MicrosoftWindowsPowerShell
   } catch { }
 }
 
-# --- Local admin RDP membership recap (image hygiene) ---
 try {
   $adm = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue)
   if ($adm.Count -gt 3) {
@@ -2708,7 +2407,6 @@ try {
   }
 } catch { }
 
-# --- Null sessions / registry remote access ---
 foreach ($rk in @(
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymous'; Want = 1 },
   @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymousSAM'; Want = 1 },
@@ -2722,7 +2420,6 @@ foreach ($rk in @(
       -Remediation ("Set {0}={1} in the image (null-session / remote-registry hardening)." -f $rk.Name, $rk.Want)
   }
   elseif ($null -eq $v -and $rk.Name -match 'AutoShare') {
-    # defaults: Wks=1 on client SKUs
     if ($rk.Name -eq 'AutoShareWks') {
       Add-Finding -Severity Low -Category 'Hardening' -Title 'AutoShareWks not set (default shares C$/ADMIN$ enabled)' `
         -Remediation 'Set AutoShareWks=0 in hardened images to kill default admin shares.'
@@ -2730,14 +2427,10 @@ foreach ($rk in @(
   }
 }
 
-######################## EXECUTIVE SUMMARY DATA ########################
-# Collected before reports are written; rendered as the tables at the top
-# of the HTML dashboard.
-
 $script:Exec = @{
   Admins            = @()
   AdminCount        = 0
-  Users             = @()   # Name, IsAdmin, Enabled, LastLogon
+  Users             = @()   
   UserCount         = 0
   EnabledCount      = 0
   DisabledCount     = 0
@@ -2758,7 +2451,6 @@ try {
   $script:Exec.Admins = $adminNames
   $script:Exec.AdminCount = $adminNames.Count
 
-  # Last-logon map from Win32_NetworkLoginProfile (local logon history)
   $logonMap = @{}
   foreach ($lp in @(Get-CimInstance Win32_NetworkLoginProfile -ErrorAction SilentlyContinue)) {
     if (-not $lp.Name) { continue }
@@ -2791,14 +2483,11 @@ try {
 }
 catch { }
 
-# Aggregates straight from the findings list
 $script:Exec.PersistCritHigh = @($script:Findings | Where-Object { $_.Category -eq 'Persistence' -and $_.Severity -in 'Critical', 'High' }).Count
 $script:Exec.PrivEscCritHigh = @($script:Findings | Where-Object { $_.Category -eq 'PrivEsc' -and $_.Severity -in 'Critical', 'High' }).Count
 $script:Exec.HardeningGaps = @($script:Findings | Where-Object { $_.Category -eq 'Hardening' -and $_.Severity -in 'Critical', 'High', 'Medium' }).Count
 $script:Exec.SecretsExposed = @($script:Findings | Where-Object { $_.Category -match 'Exposed secret|Credentials' -and $_.Severity -in 'Critical', 'High' }).Count
-$script:Exec.DevicesSeen = @($script:Findings | Where-Object { $_.Title -like 'Reachable device*' }).Count
-
-######################## SUMMARY & REPORTS ########################
+$script:Exec.DevicesSeen = @($script:Findings | Where-Object { $_.Title -like '*devices in ARP/neighbor cache*' }).Count
 
 Start-Section 'SUMMARY'
 $total = $script:Findings.Count
@@ -2821,8 +2510,6 @@ else {
 
 Write-Reports -Dir $OutputDir -LaunchHtml
 
-# Unattended mode: exit code = count of Critical+High findings (capped 250) so
-# deployment/scheduling tooling can triage hosts without parsing output.
 $critHigh = @($script:Findings | Where-Object { $_.Severity -in 'Critical', 'High' }).Count
 $exitCode = [math]::Min($critHigh, 250)
 Write-Host ''
@@ -2831,3 +2518,4 @@ exit $exitCode
 
 Write-Host ''
 Write-Host 'BlueWinPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+
