@@ -242,32 +242,8 @@ render();
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
 
-  if ($EncryptKey -and $EncryptKey.Length -ge 8) {
-    try {
-      Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
-      $salt = [byte[]](1..16)
-      $kdb = [System.Text.Encoding]::UTF8.GetBytes($EncryptKey.PadRight(32).Substring(0, 32))
-      $aes = [System.Security.Cryptography.Aes]::Create()
-      $aes.Key = $kdb
-      $aes.IV = $salt
-      $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
-      foreach ($f in @($json, $csv, $html)) {
-        if (-not (Test-Path $f)) { continue }
-        $raw = [System.IO.File]::ReadAllBytes($f)
-        $enc = $aes.CreateEncryptor().TransformFinalBlock($raw, 0, $raw.Length)
-        [System.IO.File]::WriteAllBytes($f + '.enc', $enc)
-        Remove-Item $f -Force
-        Write-Host ('Encrypted: ' + $f + '.enc') -ForegroundColor DarkCyan
-      }
-      Write-Host 'Reports AES-encrypted. Decrypt with the same key + IV 01-16.' -ForegroundColor DarkCyan
-    }
-    catch {
-      Write-Host ('Encryption failed: ' + $_.Exception.Message) -ForegroundColor Yellow
-    }
-  }
-
   # Auto-launch the HTML report in the default browser (interactive runs).
-  if ($LaunchHtml -and -not $NoLaunch -and -not $EncryptKey) {
+  if ($LaunchHtml -and -not $NoLaunch) {
     try {
       $resolved = (Resolve-Path $html).Path
       Start-Process $resolved
