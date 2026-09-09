@@ -68,12 +68,19 @@ function Write-Reports {
   if ($NoReport) { return }
   try { New-Item -ItemType Directory -Path $Dir -Force | Out-Null } catch { Write-Host "Cannot create report dir: $_" -ForegroundColor Red; return }
   $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $json = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.json" -f $env:COMPUTERNAME, $stamp)
-  $csv  = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.csv"  -f $env:COMPUTERNAME, $stamp)
-  $html = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.html" -f $env:COMPUTERNAME, $stamp)
+  if ($Obfuscate) {
+    $rid = -join ((1..12) | ForEach-Object { [char](Get-Random -Min 97 -Max 122) })
+    $baseName = "rpt_{0}_{1}" -f $rid, $stamp
+  } else {
+    $baseName = "WinHostPEAS_{0}_{1}" -f $env:COMPUTERNAME, $stamp
+  }
+  $json = Join-Path $Dir ("{0}.json" -f $baseName)
+  $csv  = Join-Path $Dir ("{0}.csv"  -f $baseName)
+  $html = Join-Path $Dir ("{0}.html" -f $baseName)
 
+  $toolLabel = if ($Obfuscate) { 'Posture Audit' } else { 'WinHostPEAS (defensive refit of winPEAS.ps1)' }
   $meta = [pscustomobject]@{
-    Tool        = 'BlueWinPEAS (defensive refit of winPEAS.ps1)'
+    Tool        = $toolLabel
     Host        = $env:COMPUTERNAME
     Generated   = (Get-Date).ToString('s')
     Duration    = $stopwatch.Elapsed.ToString('mm\:ss')
@@ -103,23 +110,23 @@ function Write-Reports {
   $catOpts = foreach ($c in $cats) { '<option value="' + $c.Name + '">' + $c.Name + ' (' + $c.Count + ')</option>' }
 
   $rowsJs = foreach ($f in $script:Findings) {
-    $esc = { param($t) if ($null -eq $t) { '' } else { $t.ToString().Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", ' ') } }
+    $esc = { param($t) if ($null -eq $t) { '' } else { $t.ToString().Replace('\', '\\').Replace('"', '\"').Replace('<', ([char]0x5c + 'u003c')).Replace('>', ([char]0x5c + 'u003e')).Replace("`r", '').Replace("`n", ' ') } }
     '  { sev: "' + $f.Severity + '", cat: "' + (& $esc $f.Category) + '", title: "' + (& $esc $f.Title) + '", detail: "' + (& $esc $f.Detail) + '", evid: "' + (& $esc $f.Evidence) + '", rem: "' + (& $esc $f.Remediation) + '" },'
   }
 
   # Executive-summary placeholder values
-  $adminList = if ($script:Exec.Admins) { $script:Exec.Admins -join ', ' } else { '(none resolved)' }
+  $adminList = if ($script:Exec.Admins) { (($script:Exec.Admins | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) }) -join ', ') } else { '(none resolved)' }
   $userRows = foreach ($u in $script:Exec.Users) {
     $ll = if ($u.LastLogon) { $u.LastLogon.ToString('yyyy-MM-dd HH:mm') } else { '<span class="never">never</span>' }
     $adm = if ($u.IsAdmin) { '<b class="adm">ADMIN</b>' } else { '' }
     $en = if ($u.Enabled) { 'enabled' } else { '<span class="dis">disabled</span>' }
-    '<tr><td>' + $u.Name + '</td><td>' + $en + '</td><td>' + $adm + '</td><td>' + $ll + '</td></tr>'
+    '<tr><td>' + [System.Net.WebUtility]::HtmlEncode([string]$u.Name) + '</td><td>' + $en + '</td><td>' + $adm + '</td><td>' + $ll + '</td></tr>'
   }
   $userRows = @('<tr><th>User</th><th>Status</th><th>Role</th><th>Last logon</th></tr>') + @($userRows)
 
   $htmlDoc = @"
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
+<title>WinHostPEAS Report - $($env:COMPUTERNAME)</title>
 <style>
  body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f1f5f9;color:#111827}
  header{background:#0f172a;color:#fff;padding:18px 28px}
@@ -159,7 +166,7 @@ function Write-Reports {
  .dis{color:#94a3b8}
 </style></head><body>
 <header>
- <h1>BlueWinPEAS Posture Audit &mdash; $($env:COMPUTERNAME)</h1>
+ <h1>$(if ($Obfuscate) { "Posture Audit" } else { "WinHostPEAS Posture Audit" }) &mdash; $($env:COMPUTERNAME)</h1>
  <div class="meta">Generated $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; $($meta.TotalFindings) findings &middot; highest severity: $($meta.HighestSeverity) &middot; FullCheck: $($meta.FullCheck)</div>
 </header>
 <div class="bar">
@@ -182,7 +189,7 @@ function Write-Reports {
     <tr><td>Hardening gaps (Crit/High/Med)</td><td><b>$($script:Exec.HardeningGaps)</b></td></tr>
     <tr><td>Exposed secrets (Crit/High)</td><td><b>$($script:Exec.SecretsExposed)</b></td></tr>
     <tr><td>Devices seen on network</td><td><b>$($script:Exec.DevicesSeen)</b> (passive ARP/neighbor cache - no packets sent)</td></tr>
-    <tr><td>Scan mode</td><td>Fully passive - local checks and network visibility read local state only, no packets sent to other hosts</td></tr>
+    <tr><td>Scan mode</td><td>Fully passive host recon - every check reads local state only (registry, WMI, local socket tables, local files). No network packets are sent to any host, including domain controllers.</td></tr>
    </table>
   </div>
   <div class="exec-card">
@@ -235,8 +242,32 @@ render();
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
 
+  if ($EncryptKey -and $EncryptKey.Length -ge 8) {
+    try {
+      Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+      $salt = [byte[]](1..16)
+      $kdb = [System.Text.Encoding]::UTF8.GetBytes($EncryptKey.PadRight(32).Substring(0, 32))
+      $aes = [System.Security.Cryptography.Aes]::Create()
+      $aes.Key = $kdb
+      $aes.IV = $salt
+      $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+      foreach ($f in @($json, $csv, $html)) {
+        if (-not (Test-Path $f)) { continue }
+        $raw = [System.IO.File]::ReadAllBytes($f)
+        $enc = $aes.CreateEncryptor().TransformFinalBlock($raw, 0, $raw.Length)
+        [System.IO.File]::WriteAllBytes($f + '.enc', $enc)
+        Remove-Item $f -Force
+        Write-Host ('Encrypted: ' + $f + '.enc') -ForegroundColor DarkCyan
+      }
+      Write-Host 'Reports AES-encrypted. Decrypt with the same key + IV 01-16.' -ForegroundColor DarkCyan
+    }
+    catch {
+      Write-Host ('Encryption failed: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
+  }
+
   # Auto-launch the HTML report in the default browser (interactive runs).
-  if ($LaunchHtml -and -not $NoLaunch) {
+  if ($LaunchHtml -and -not $NoLaunch -and -not $EncryptKey) {
     try {
       $resolved = (Resolve-Path $html).Path
       Start-Process $resolved

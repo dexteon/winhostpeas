@@ -4,19 +4,24 @@
 # has EVER joined, every WiFi profile, cached DNS answers, RDP/SSH history,
 # and static routes. This is the "previously talked to" record.
 
+function ConvertFrom-NetworkListSystemTime($val) {
+  # NetworkList DateCreated / DateLastConnected are REG_BINARY SYSTEMTIME (16 bytes,
+  # little-endian WORDs: year, month, dayOfWeek, day, hour, minute, second, ms).
+  if (-not $val) { return $null }
+  try {
+    $b = [byte[]]$val
+    if ($b.Count -ne 16) { return $null }
+    $yr = [BitConverter]::ToUInt16($b, 0)
+    if ($yr -lt 1980 -or $yr -gt 2400) { return $null }
+    return (Get-Date -Year $yr -Month ([BitConverter]::ToUInt16($b, 2)) -Day ([BitConverter]::ToUInt16($b, 6)) `
+        -Hour ([BitConverter]::ToUInt16($b, 8)) -Minute ([BitConverter]::ToUInt16($b, 10)) -Second ([BitConverter]::ToUInt16($b, 12)) -ErrorAction Stop)
+  } catch { return $null }
+}
+
 Start-Section 'CONNECTIVITY HISTORY (PREVIOUSLY CONNECTED / TALKED TO)'
 
 # 1) Windows NetworkList: every network ever connected (wired + WiFi)
 try {
-  $sig = @'
-using System;
-using System.Runtime.InteropServices;
-public static class NetList {
-  [DllImport("ole32.dll")]
-  public static extern uint CLSIDFromString(string lpsz, out Guid pclsid);
-}
-'@
-  Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
   $paths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles',
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged',
@@ -30,16 +35,8 @@ public static class NetList {
       $name = $props.ProfileName
       if (-not $name) { $name = $props.Description }
       if (-not $name) { return }
-      $first = $null; $last = $null
-      if ($props.DateCreated) {
-        try {
-          $b = [byte[]]$props.DateCreated
-          if ($b.Count -eq 16) {
-            $first = [datetime]::FromFileTime([BitConverter]::ToInt64($b, 8))
-            $last = [datetime]::FromFileTime([BitConverter]::ToInt64($b, 0))
-          }
-        } catch { }
-      }
+      $first = ConvertFrom-NetworkListSystemTime $props.DateCreated
+      $last = ConvertFrom-NetworkListSystemTime $props.DateLastConnected
       $nets += [pscustomobject]@{
         Name = $name; Type = $(if ($props.Category -eq 1) { 'Private' } elseif ($props.Category -eq 0) { 'Public' } else { 'Domain/Other' })
         FirstSeen = $first; LastConnected = $last; Path = $_.PSChildName
@@ -54,7 +51,7 @@ public static class NetList {
   if (@($dedup).Count -eq 0 -and -not $netListReadable) {
     Add-Finding -Severity Info -Category 'History' -Title 'NetworkList history unreadable without elevation' `
       -Detail 'The NetworkList registry key requires admin. Run elevated to capture previously-connected network history.' `
-      -Remediation 'Schedule BlueWinPEAS elevated for full connectivity history.'
+      -Remediation 'Schedule WinHostPEAS elevated for full connectivity history.'
   }
   else {
     Add-Finding -Severity Info -Category 'History' -Title ('{0} distinct networks previously connected (NetworkList)' -f @($dedup).Count) `

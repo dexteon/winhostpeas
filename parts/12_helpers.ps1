@@ -1,24 +1,8 @@
 
 ######################## RETAINED HELPERS (defensive refit) ########################
-# ACL / SID / AD helper functions carried over from winPEAS.ps1 - unchanged logic.
-
-function Convert-SidToName {
-  param($SidInput)
-  if ($null -eq $SidInput) { return $null }
-  try {
-    if ($SidInput -is [System.Security.Principal.SecurityIdentifier]) { $sidObject = $SidInput }
-    else { $sidObject = New-Object System.Security.Principal.SecurityIdentifier($SidInput) }
-    return $sidObject.Translate([System.Security.Principal.NTAccount]).Value
-  }
-  catch {
-    try { return $sidObject.Value } catch { return [string]$SidInput }
-  }
-}
-
-function Get-DomainContext {
-  try { return [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain() }
-  catch { return $null }
-}
+# Local-only helpers: weak-ACL detection and installed-software inventory.
+# Nothing here contacts a domain controller. (Convert-SidToName / Get-DomainContext
+# were removed with the DC-querying AD checks.)
 
 # ACL check refit: record weak service/path ACLs as findings instead of console hints.
 function Start-ACLCheck {
@@ -31,17 +15,18 @@ function Start-ACLCheck {
     whoami.exe /groups /fo csv 2>$null | Select-Object -skip 2 | ConvertFrom-Csv -Header 'group name' |
       Select-Object -ExpandProperty 'group name' | ForEach-Object { $Identity += $_ }
   } catch { }
-  $currentUser = "$env:COMPUTERNAME\$env:USERNAME"
   $everyoneLike = @('Everyone', 'BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'BUILTIN\Authenticated Users')
   foreach ($i in $Identity) {
     $permission = $ACLObject.Access | Where-Object { $_.IdentityReference -like $i }
+    # FileSystemRights stringifies as a combined flag list (e.g. "Modify, Synchronize"),
+    # so match substrings rather than requiring an exact single value.
+    $fsr = "$($permission.FileSystemRights)"
+    $rr = "$($permission.RegistryRights)"
     $userPermission = ''
-    switch -WildCard ("$($Permission.FileSystemRights)") {
-      'FullControl' { $userPermission = 'FullControl' }
-      'Write*'      { $userPermission = 'Write' }
-      'Modify'      { $userPermission = 'Modify' }
-    }
-    if ("$($Permission.RegistryRights)" -eq 'FullControl') { $userPermission = 'FullControl' }
+    if ($fsr -match 'FullControl') { $userPermission = 'FullControl' }
+    elseif ($fsr -match 'Modify') { $userPermission = 'Modify' }
+    elseif ($fsr -match 'Write') { $userPermission = 'Write' }
+    if ($rr -match 'FullControl') { $userPermission = 'FullControl' }
     if ($userPermission) {
       # filter benign: Users write on their own profile paths is by-design
       if ($Target -like "*$env:USERNAME*") { continue }
@@ -68,25 +53,28 @@ function Start-ACLCheck {
   }
 }
 
+# Installed-software inventory via a direct LOCAL registry read of the 64-bit,
+# 32-bit (Wow6432Node) and per-user uninstall hives. Does not use the
+# remote-registry API and does not depend on the RemoteRegistry service.
 function Get-InstalledApplications {
-  [cmdletbinding()]
-  param([Parameter(DontShow)]$keys = @('', '\Wow6432Node'))
-  foreach ($key in $keys) {
-    try {
-      $apps = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $env:COMPUTERNAME).OpenSubKey("SOFTWARE$key\Microsoft\Windows\CurrentVersion\Uninstall").GetSubKeyNames()
-    }
-    catch { continue }
-    foreach ($app in $apps) {
-      $program = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $env:COMPUTERNAME).OpenSubKey("SOFTWARE$key\Microsoft\Windows\CurrentVersion\Uninstall\$app")
-      $name = $program.GetValue('DisplayName')
-      if ($name) {
+  $roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+  )
+  foreach ($root in $roots) {
+    if (-not (Test-Path $root)) { continue }
+    $arch = if ($root -match 'Wow6432Node') { 'x86' } else { 'x64' }
+    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+      $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+      if ($props -and $props.DisplayName) {
         [pscustomobject]@{
           Computername = $env:COMPUTERNAME
-          Software     = $name
-          Version      = $program.GetValue('DisplayVersion')
-          Publisher    = $program.GetValue('Publisher')
-          InstallDate  = $program.GetValue('InstallDate')
-          Architecture = $(if ($key -eq '\wow6432node') { 'x86' } else { 'x64' })
+          Software     = $props.DisplayName
+          Version      = $props.DisplayVersion
+          Publisher    = $props.Publisher
+          InstallDate  = $props.InstallDate
+          Architecture = $arch
         }
       }
     }

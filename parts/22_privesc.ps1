@@ -123,14 +123,42 @@ foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBacku
   }
 }
 
-# UAC
-$enableLUA = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue).EnableLUA
-if ($enableLUA -ne 1) {
-  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC disabled (EnableLUA != 1)' `
-    -Remediation 'Set EnableLUA=1; UAC off means every process runs unprompted at full elevation rights.'
+# UAC. A MISSING EnableLUA is not the same as EnableLUA=0 - the value is present
+# on a stock install, so its absence points at tampering or a stripped image, and
+# the remediation differs. Report the two cases distinctly.
+$uacKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+$uacProps = Get-ItemProperty $uacKey -ErrorAction SilentlyContinue
+$hasLUA = $uacProps -and ($uacProps.PSObject.Properties.Name -contains 'EnableLUA')
+$enableLUA = $uacProps.EnableLUA
+if (-not $hasLUA) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC EnableLUA value is absent from the registry' `
+    -Detail ('{0} has no EnableLUA value. Windows ships with it set to 1, so its absence means it was removed. Confirm behaviourally: if an elevation request succeeds with no consent prompt, UAC is not protecting this host.' -f $uacKey) `
+    -Evidence $uacKey `
+    -Remediation 'Recreate EnableLUA (DWORD) = 1 and reboot, then investigate what removed it.'
+}
+elseif ($enableLUA -ne 1) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title ('UAC disabled (EnableLUA = {0})' -f $enableLUA) `
+    -Detail 'Every process launched by an administrator runs fully elevated with no consent prompt.' `
+    -Remediation 'Set EnableLUA=1 and reboot.'
 }
 else {
-  Add-Finding -Severity Info -Category 'PrivEsc' -Title 'UAC enabled'
+  Add-Finding -Severity Info -Category 'PrivEsc' -Title 'UAC enabled (EnableLUA = 1)'
+}
+
+# Consent behaviour: 0 = elevate silently, which defeats UAC even when EnableLUA=1.
+if ($uacProps -and ($uacProps.PSObject.Properties.Name -contains 'ConsentPromptBehaviorAdmin') -and $uacProps.ConsentPromptBehaviorAdmin -eq 0) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'UAC set to elevate silently (ConsentPromptBehaviorAdmin = 0)' `
+    -Detail 'Administrators are elevated with no prompt, so a compromised user-context process can take full admin unattended.' `
+    -Remediation 'Set ConsentPromptBehaviorAdmin=5 (prompt for consent for non-Windows binaries) or higher.'
+}
+
+# Remote UAC restrictions. =1 gives LOCAL admin accounts an unfiltered token over
+# the network, which is what makes pass-the-hash against admin shares work here.
+if ($uacProps -and $uacProps.LocalAccountTokenFilterPolicy -eq 1) {
+  Add-Finding -Severity High -Category 'PrivEsc' -Title 'Remote UAC restrictions disabled (LocalAccountTokenFilterPolicy = 1)' `
+    -Detail 'Local administrator accounts receive a full token over the network, enabling pass-the-hash and remote admin-share access with local credentials.' `
+    -Evidence $uacKey `
+    -Remediation 'Delete LocalAccountTokenFilterPolicy unless a remote-management tool documents needing it; prefer domain accounts for remote admin.'
 }
 
 # PrintNightmare-relevant PointAndPrint policy

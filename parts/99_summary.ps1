@@ -31,4 +31,4 @@ Write-Host ("Exit code will be {0} (Critical+High count) for unattended triage."
 exit $exitCode
 
 Write-Host ''
-Write-Host 'BlueWinPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+Write-Host 'WinHostPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan

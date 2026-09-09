@@ -1,135 +1,189 @@
-# BlueWinPEAS
+# WinHostPEAS
 
-**A blue-team refit of winPEAS.ps1 — the attacker's local enumeration engine, rebuilt as a full defensive vulnerability-recon tool for Windows Server 2019/2022/2025 and Windows 10/11, including IIS and IIS Rewrite deep recon.**
+**A blue-team refit of winPEAS.ps1: the attacker's local enumeration engine rebuilt as a passive, read-only posture audit for Windows Server 2019/2022/2025 and Windows 10/11, including IIS deep recon.**
 
-BlueWinPEAS keeps the detection surface an attacker would enumerate against a host, but repurposes every check for defenders: structured findings with severity and remediation instead of exploit instructions, secret *detection* instead of secret *exfiltration*, OT-safe network discovery, and JSON/CSV/HTML reports built for unattended fleet runs.
+WinHostPEAS keeps the enumeration surface an attacker would walk on a host, but turns every check around. You get structured findings with severity and remediation instead of exploit paths, secret detection instead of secret exfiltration, and JSON/CSV/HTML reports built for unattended fleet runs.
 
-Derived from [winPEAS.ps1 v1.3](https://github.com/peass-ng/PEASS-ng) (PEASS-ng / @RandolphConley). Original tooling preserved nowhere in this repo — this is the defensive fork.
+Derived from [winPEAS.ps1](https://github.com/peass-ng/PEASS-ng) (PEASS-ng / @RandolphConley). No offensive tooling is retained.
 
 ---
 
-## Why
+## Two guarantees
 
-winPEAS answers *"how would I escalate from here?"* BlueWinPEAS answers *"what would an attacker find if they landed on this host, and how do I fix it before they do?"* Same enumeration surface, opposite posture:
+**It sends nothing.** Every check reads local state only: registry, WMI, local socket tables, local files. There are no ICMP sweeps, no port scans, no banner grabs, and no LDAP or NTP queries. Nothing is sent to a domain controller. Domain membership comes from `Win32_ComputerSystem`, never from contacting a DC. The external binaries it shells out to are all read-only verbs: `auditpol /get`, `secedit /export`, `bcdedit /enum`, `netsh ... show`, `whoami /groups`.
 
-| | winPEAS.ps1 | BlueWinPEAS |
+**It changes nothing.** No registry writes, no service or policy changes, no ACL edits. It writes its own reports to `-OutputDir` and one temporary secedit export to `%TEMP%`, which it then deletes. Remediation text tells you what to change; the tool never changes it for you.
+
+You can verify both by grepping the single shipped script. Neither claim depends on trusting this document.
+
+## Why it exists
+
+winPEAS answers "how do I escalate from here?" WinHostPEAS answers "what would an attacker find if they landed here, and how do I close it first?"
+
+| | winPEAS.ps1 | WinHostPEAS |
 |---|---|---|
-| Output | Raw console dump | 252+ structured findings (Severity/Category/Remediation) |
-| Secrets | Prints passwords, WiFi keys, clipboard, DPAPI blobs | Detects + **redacts** — values never reach console or reports |
-| Guidance | "Try mimikatz", msfvenom recipes | Fix instructions, MITRE technique IDs, IEC 62443 / CIS references |
-| AV | Flagged by Defender at download **and** AMSI-blocked at run | Runs clean — pure PowerShell/.NET, no exploit strings |
-| Network | None | ARP/neighbor discovery, ICMP-only subnet sweep, OT-safe banner grab |
-| Reports | None | JSON + CSV + HTML per host |
-| Unattended | No | Exit code = Critical+High count for fleet triage |
-| Runtime (typical) | 30–60+ min full-drive regex crawl | ~2 min default, ~6 min `-FullCheck` |
-
-Both were run side-by-side on the same host during development. winPEAS required a manual Defender exclusion to execute; BlueWinPEAS ran clean with realtime protection on.
+| Output | Console dump | Structured findings (Severity/Category/Remediation) |
+| Secrets | Prints passwords, WiFi keys, DPAPI blobs | Detects and redacts; values never reach console or report |
+| Guidance | "Try mimikatz" | Fix instructions, MITRE technique IDs, IEC 62443 / CIS references |
+| AV | Defender-flagged, AMSI-blocked | Runs clean with realtime protection on |
+| Network | Active scanning | Nothing sent, local reads only |
+| Unattended | No | Exit code = Critical+High count |
 
 ## Usage
 
 ```powershell
-# Fast posture audit (default) - ~2 minutes
-pwsh -File BlueWinPEAS.ps1 -OutputDir .\BlueWinPEAS_Output
+# Fast posture audit
+pwsh -File WinHostPEAS.ps1 -OutputDir .\WinHostPEAS_Output
 
-# Deep run: adds scoped secret-pattern sweep + full inventory - ~6 minutes
-pwsh -File BlueWinPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStamp
-
-# Unattended fleet: exit code = Critical+High finding count (capped 250)
-# schedule via GPO/SCCM/Intune/PDQ; centralize reports on a UNC path
+# Deep run: adds a scoped, redacted secret-pattern sweep
+pwsh -File WinHostPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStamp
 ```
-
-Parameters:
 
 | Switch | Effect |
 |---|---|
-| `-FullCheck` | Adds deep (redacted) secret-pattern sweep of credential-bearing dirs + registry areas |
-| `-OutputDir <path>` | Report destination (default `.\BlueWinPEAS_Output`) — use UNC for fleet centralization |
+| `-FullCheck` | Adds a redacted secret-pattern sweep of credential-bearing directories and registry areas |
+| `-OutputDir <path>` | Report destination (default `.\WinHostPEAS_Output`); use a UNC path for fleet centralization |
 | `-TimeStamp` | Per-section elapsed-time stamps |
 | `-NoReport` | Console only, no files written |
+| `-NoLaunch` | Do not open the HTML dashboard; use this for unattended runs |
+| `-Obfuscate` | Randomized report filenames and a generic tool label |
+| `-EncryptKey <str>` | AES-encrypts the reports. Read the warning below before relying on it. |
 
-Read-only: BlueWinPEAS changes nothing on the host.
+Reference runtimes on a Windows 11 workstation: about 35 seconds by default, about 2 minutes with `-FullCheck`.
 
-## Feature writeup
+## Run it elevated
 
-### 1. Findings engine
-Every check funnels into one engine. Each finding carries `Timestamp, Host, Severity (Critical/High/Medium/Low/Info), Category, Title, Detail, Evidence, Remediation`. Reports aggregate by severity, list top Critical/High first. Exit code equals the Critical+High count so deployment tooling can triage hosts without parsing anything.
+The tool works fine as a standard user, but about a dozen checks need administrator: audit policy, the secedit baseline, boot configuration, Security event log settings, BitLocker, WMI event subscriptions, connectivity history, the scheduled-task file baseline, and other users' process details.
 
-### 2. Secret detection without secret exposure
-The winPEAS regex corpus (AWS keys, GitHub/GitLab tokens, JWTs, private key blocks, Slack tokens, Stripe keys, connection strings, 25+ patterns) is kept for **detection**: matches are recorded as findings with the value replaced by a fingerprint (`<redacted:52ch, ends ...Xy9a>`). Removed outright: WiFi password dumps, clipboard content printing, UWP PasswordVault dumping, OpenVPN DPAPI decryption, PowerShell history echoing. What remains is *knowledge that a secret exists and where* — enough to rotate it, not enough to leak it from a report left on a share.
+When a check cannot run, WinHostPEAS says so. It emits an explicit "not assessed (needs elevation)" finding instead of reporting a clean result. That rule drives a lot of the design: a check that could not execute must never look like a check that found nothing wrong. A banner at the top of every run states which context it ran in.
 
-### 3. Credential-exposure hardening checks
-WDigest plaintext storage, LSA Protection (RunAsPPL), Credential Guard, cached-domain-logon count, AutoAdminLogon + embedded Winlogon passwords (redacted), RDCMan artifacts, PuTTY stored proxy passwords, ssh-agent key registration, DPAPI key stores, unattend/sysprep answer files, cloud CLI credential files (`.aws`, `.azure`, `.kube`, `.docker`, `.git-credentials`, gcloud), Sticky Notes DB, SAM/SYSTEM hive copies, PSReadLine history credential patterns.
+If you audit only non-elevated, expect partial coverage, and read the "not assessed" findings as gaps rather than passes.
 
-### 4. Privilege-escalation surface (attacker's view, defender's fixes)
-AlwaysInstallElevated, unquoted service paths, weak ACLs on service binaries and service registry keys, user-writable startup items, Run/RunOnce persistence inventory, dangerous token privileges held by the current user (SeImpersonate, SeDebug, SeBackup...), UAC state, PrintNightmare-relevant PointAndPrint policy, WSUS-over-HTTP, writable scheduled-task actions.
+## What it checks
 
-### 5. Defender / AV posture
-Defender realtime status + signature freshness + scan recency, **exclusion inventory** (the first thing attackers add — every exclusion path/process/extension is listed with a review recommendation), firewall profile states.
+### Findings engine
 
-### 6. Logging & detection coverage
-auditpol critical subcategories (Logon/Logoff, Privilege Use, Object Access), Security event log size, Windows Event Forwarding presence, PowerShell ScriptBlock/Module/Transcription logging gaps — the telemetry an attacker hopes is missing.
+Every check funnels into one collector. Each finding carries `Timestamp, Host, Severity (Critical/High/Medium/Low/Info), Category, Title, Detail, Evidence, Remediation`. The process exit code equals the Critical+High count, so deployment tooling can triage without parsing anything.
 
-### 7. Network attack surface
-SMBv1, SMB signing, LLMNR / NBT-NS (responder-class capture risk), RDP NLA + SecurityLayer, listening-port inventory with risky-classic flags (Telnet/FTP/SMB/RDP/WinRM), hosts-file overrides, WPAD, world-writable SMB shares.
+### Secret detection without secret exposure
 
-### 8. Network discovery — ARP, neighbors, devices
-Passive ARP/neighbor table snapshot first. Then ICMP-only ping sweep of each directly-connected /24 (async, sub-10s per subnet): every responding device recorded with IP, resolved MAC, RTT, and MAC-OUI vendor tag (Siemens, Rockwell, VMware, Raspberry Pi...). Virtualization MACs in an OT subnet raise a Medium finding — an unmanaged VM where a controller should be. Active-conversation inventory shows who the host actually talks to.
+The winPEAS regex corpus (cloud keys, GitHub/GitLab tokens, JWTs, private-key blocks, connection strings, and more) is kept for detection only. Matches are recorded with the value replaced by a fingerprint such as `<redacted:52ch, ends ...Xy9a>`. Removed outright: WiFi password dumps, clipboard printing, PasswordVault dumping, DPAPI decryption, history echoing. You learn that a secret exists and where it lives, which is enough to rotate it and not enough to leak it from a report left on a share.
 
-**OT-safe by design**: ICMP echo + TCP connect only. No SYN scans, no protocol frames at PLCs — active scanning can crash fragile legacy controllers; banner grabs send zero payload bytes, they only listen.
+### Credential exposure
 
-### 9. Service & version inventory
-Local listeners mapped to owning process + binary version. Port dictionary covers IT (MSSQL, RDP, VNC...) and BMS/OT protocols: Modbus/TCP 502, BACnet 47808, EtherNet/IP 44818, OPC-UA 4840/4843, DNP3 20000, Niagara Fox 1911/5011/4911, Omron FINS 9600, Crestron 41794, CoDeSys, mDNS/SSDP discovery ports. OT-protocol listeners on the host are flagged Medium with IEC 62443 SR 5.1 (zone/conduit) remediation. Passive banner grab runs against discovered devices (12 common ports, short timeout). Installed-software scan matches a 19-vendor BMS dictionary (Tridium Niagara, JCI Metasys, Siemens Desigo/APOGEE, Schneider EcoStruxure, Trane, Carrier, ALC WebCTRL, Distech, Delta, Reliable, CoDeSys, KEPServerEX, MatrikonOPC, Wonderware, Ignition...) so controller/HMI/JACE software is versioned in the report for CVE watchlisting.
+WDigest plaintext storage, LSA Protection (RunAsPPL), Credential Guard, cached logon count, AutoAdminLogon passwords (redacted), PuTTY stored proxy passwords, ssh-agent keys, unattend and sysprep answer files, cloud CLI credential files, SAM/SYSTEM hive copies.
 
-### 10. Loopback & tunnel detection
-Seven checks for loopback abuse and covert channels: loopback-bound listeners (owning PID/process, deduped across IPv4/IPv6), loopback conversations, **netsh portproxy rules** (High — classic T1090 relay persistence), SSH/plink `-L/-R/-D` tunnel processes (with full command line), DNS terminating on loopback (DNS-tunneling indicator), hosts-file loopback overrides (silent traffic redirection), proxy localhost-bypass config.
+### Privilege escalation
 
-### 11. Local account hygiene & AD
-Passwordless local accounts (Critical), minimum password length, never-expiring passwords, local admin inventory, LAPS presence (legacy + Windows LAPS), BitLocker, screen-lock timeout. Domain-joined hosts add: LmCompatibilityLevel, insecure dynamic-DNS ACLs, Kerberoastable privileged SPN accounts, gMSA passwords readable by broad principals, ADCS ESC10 Schannel UPN mapping, Kerberos time skew.
+AlwaysInstallElevated, unquoted service paths, weak ACLs on service binaries and service registry keys, user-writable startup items, dangerous token privileges held by the caller (SeImpersonate, SeDebug, SeBackup), PointAndPrint policy, WSUS over HTTP, writable scheduled-task actions.
 
-### 12. Patch posture
-Hotfix recency (60-day staleness = High), pending-reboot detection (patched-but-not-finalized CVE exposure).
+UAC coverage distinguishes *EnableLUA absent* from *EnableLUA = 0*, because a deleted value implies tampering and calls for different remediation. It also flags silent-elevation consent and `LocalAccountTokenFilterPolicy = 1`, the setting that makes pass-the-hash work against admin shares.
 
-### 13. IIS / web-server recon (Server 2019/2022, Win10/11 with IIS)
-Full read-only IIS inventory via Microsoft.Web.Administration: sites + bindings (HTTP-only sites flagged Medium), app pools (identity — LocalSystem pools are High; legacy .NET 2.0 runtimes; 32-bit flags), web-root writability checks (writable root = webshell drop-in, High). Certificate store audit: expired certs (Critical), expiring <30d, weak MD5/SHA1 signatures. **IIS URL Rewrite module**: version check against known-fixed builds (2.1.2105+), stale-build advisory flag. web.config sweep across every site root + inetpub: plaintext DB passwords in connection strings (High), weak machineKey validation/short validationKey (ViewState forgery path, High), directoryBrowse enabled, `retail=false`, plus the full secret-pattern scan. applicationHost.config: Basic-auth-over-HTTP, anonymous auth inventory, password-shaped values, and a Critical if the file itself is user-writable (= total IIS takeover). IIS FTP/SMTP service presence. WinRM: HTTP-listener and AllowUnencrypted/Basic-auth checks.
+### Defender and AV posture
 
-### 14. OS vulnerability / crypto surface
-OS build + end-of-support table (Server 2008–2025, Win10/11) with EOL = Critical and <1-year = Medium; Windows 11 feature-update currency (24H2=26100). TLS protocol inventory from SCHANNEL (SSLv2/3, TLS 1.0/1.1 active = High; TLS 1.2/1.3 presence confirmed), enabled cipher-suite audit (NULL/RC4/3DES = Medium), FIPS status. SMBv1 (Critical) + SMB signing server/client. .NET Framework version (pre-4.7 = Medium), legacy v2/v3.x runtimes, SchUseStrongCrypto machine.config gap. Legacy optional features (PowerShellv2, Telnet/TFTP clients, SMB1, NetFx3). secedit policy baseline: password minimum length, lockout threshold, anonymous SAM lookup. RDP encryption level + SecurityLayer. bcdedit testsigning/nointegritychecks (unsigned driver = rootkit path, High).
+Realtime status, signature freshness, scan recency, and a full exclusion inventory. Exclusions are the first thing an attacker adds. A standard user only sees a subset of them, so a non-elevated run labels the count PARTIAL instead of presenting it as complete.
 
-### 15. Persistence deep-dive
-The stealthier persistence slots beyond autoruns/startup/tasks: **Winlogon hijacks** (Shell/Userinit/Taskman/System replacements — Critical), **WMI permanent event subscriptions** (ActiveScript/CommandLine consumers — fileless SYSTEM persistence), **per-user COM hijack surface** (HKCU CLSID overrides with servers outside Windows/Program Files — invisible to per-machine audits), **IFEO Debuggers** + GlobalFlag/SilentProcessExit monitors (arbitrary-code-launch primitives), **AppInit_DLLs** (global DLL injection), **non-standard LSA Security/Notification Packages** (LSASS-loaded DLLs — mimikatz territory, Critical), **Active Setup StubPaths** in user-writable paths (executes for every new user), **netsh helper DLLs** outside standard paths, screensaver hijacks. Each finding carries a clean-image baseline comparison instruction.
+### Logging and detection coverage
 
-### 16. Image hardening baseline (the switch-to-flip list)
-Built for the golden-image goal — every check reports current state + the exact image change: **Defender ASR rules** (none enabled = High; ASR blocks the very techniques this tool detects, incl. the WMI-persistence rule), **Controlled Folder Access** (ransomware guard), **Defender network protection** (C2 callback kill) and **cloud-delivered protection**; **Exploit Protection** (DEP, mandatory ASLR/ForceRelocateImages, CFG); **AppLocker / WDAC application control** — absent policy = High, flagged as the single highest-value hardening control for an image; SmartScreen; **UAC consent levels** (silent-elevate = High); Guest account; removable features to strip from the image (Telnet/TFTP/PowerShellv2/SMB1); local admin count trim; null-session/remote-registry hardening (RestrictAnonymous, RestrictAnonymousSAM, RemoteRegistry start, AutoShareWks/Server default-share kill).
+auditpol subcategories, Security event log sizing, Windows Event Forwarding, and PowerShell ScriptBlock/Module/Transcription logging gaps. This is the telemetry an attacker hopes is missing.
 
-**Hardening workflow for the image:** run BlueWinPEAS on the golden image → filter findings to Category = `Hardening` → each Remediation line is a build change (GPO/registry/Defender preference). Run again after each change to verify; exit code drops as the image hardens. Persistence/privesc categories double as regression tests — a hardened image should return zero Critical/High in `Persistence`, `PrivEsc`, and `Hardening` before rollout.
+### Network attack surface
+
+SMBv1 and SMB signing, LLMNR/NBT-NS, RDP NLA and SecurityLayer, listening-port inventory with risky-classic flags, hosts-file overrides, WPAD, world-writable shares. Port visibility comes from the local socket table, not from scanning.
+
+### Passive network visibility
+
+ARP and neighbour cache plus established-connection inventory, with MAC-OUI vendor tagging. This shows who the host already talks to. Nothing is probed.
+
+### Service and OT inventory
+
+Local listeners mapped to owning process and binary version, against a port dictionary covering IT services and BMS/OT protocols (Modbus/TCP 502, BACnet 47808, EtherNet/IP 44818, OPC-UA 4840/4843, DNP3 20000, Niagara Fox, Omron FINS, CoDeSys). OT listeners are flagged with IEC 62443 SR 5.1 zone and conduit remediation. Installed software is matched against a BMS vendor dictionary so controller and HMI software is versioned for CVE watchlisting.
+
+### Loopback and tunnel detection
+
+Loopback-bound listeners with owning process, loopback conversations, `netsh portproxy` rules (classic T1090 relay persistence), SSH/plink `-L/-R/-D` tunnels, DNS terminating on loopback, hosts-file redirection, proxy bypass config.
+
+### Account hygiene and identity
+
+Passwordless local accounts, password policy, never-expiring passwords, local admin inventory, LAPS presence, BitLocker, screen-lock timeout. Domain-joined hosts also get NTLM policy and ADCS ESC10 Schannel UPN mapping, both read from the local registry.
+
+Domain-side hygiene such as Kerberoastable SPNs and gMSA read permissions is deliberately not assessed, because every way to check it means querying a domain controller.
+
+### Patch posture
+
+Hotfix recency and pending-reboot detection.
+
+### IIS and web server
+
+Read-only inventory via `Microsoft.Web.Administration`: sites and bindings, app pool identities, web-root writability, certificate expiry and weak signatures, URL Rewrite version currency. The web.config sweep looks for plaintext connection-string passwords, weak machineKey validation, directory browsing, and `retail=false`. applicationHost.config checks for Basic-auth-over-HTTP, and raises a Critical if the file itself is user-writable. WinRM transport and auth are covered too, including service state and listening ports when the listener config is unreadable.
+
+### OS and crypto surface
+
+Build and end-of-support status, SCHANNEL protocol inventory, enabled cipher-suite audit, FIPS status, SMB signing, .NET version and `SchUseStrongCrypto`, legacy optional features, secedit password and lockout baseline, RDP encryption level, and bcdedit testsigning and code-integrity state.
+
+### Persistence deep-dive
+
+The quieter slots beyond autoruns: Winlogon Shell/Userinit/Taskman hijacks, WMI permanent event subscriptions, per-user COM hijacks, IFEO Debuggers and SilentProcessExit monitors, AppInit_DLLs, non-standard LSA Security and Notification packages, Active Setup StubPaths, netsh helper DLLs, screensaver hijacks.
+
+### Advanced persistence and obfuscation
+
+UAC-bypass registry residue (fodhelper, eventvwr, sdclt), file-association and ProgID hijacks across HKLM and HKCU, non-standard service recovery commands, AMSI provider state including provider DLLs outside protected paths, encoded or reflective PowerShell in console history, and core Windows binaries running outside their expected directories.
+
+Scheduled tasks are scanned for obfuscated commands, including tasks under `\Microsoft\`. Masquerading hides there, so excluding that tree would blind the check at its most useful target.
+
+### Image hardening baseline
+
+Every check reports current state plus the exact image change: Defender ASR rules (against Microsoft's canonical rule list), Controlled Folder Access, network and cloud-delivered protection, Exploit Protection, AppLocker/WDAC, SmartScreen, UAC consent level, Guest account, features to strip, admin-count trim, and null-session and remote-registry hardening.
+
+## Hardening workflow
+
+Run against the golden image, filter to Category `Hardening`, and treat each Remediation line as a build change. Re-run after each change; the exit code falls as the image hardens.
+
+The `Persistence` and `PrivEsc` categories double as regression tests. A finished image should return zero Critical/High across `Persistence`, `PrivEsc`, and `Hardening` before rollout.
 
 ## Unattended fleet deployment
 
-1. Copy `BlueWinPEAS.ps1` to a share or push via your deployment tool.
-2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\BlueWinPEAS.ps1 -OutputDir \\server\share\BlueWinPEAS -FullCheck`
-3. Each host writes `BlueWinPEAS_<HOST>_<timestamp>.{json,csv,html}`.
-4. Triage by exit code: 0 = no Critical/High; N = N Critical/High findings; or ingest the JSONs into your SIEM/CMDB (stable schema, one array of finding objects).
+1. Copy `WinHostPEAS.ps1` to a share, or push it with your deployment tool.
+2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\WinHostPEAS.ps1 -OutputDir \\server\share\WinHostPEAS -FullCheck -NoLaunch`
+3. Each host writes `WinHostPEAS_<HOST>_<timestamp>.{json,csv,html}`.
+4. Triage on exit code, or ingest the JSON into a SIEM or CMDB. The schema is stable: one array of finding objects under `Findings`, with a `Meta` block.
 
-Runtime on a typical BMS box: ~2 min default, ~6 min `-FullCheck`. The slow winPEAS full-drive crawl was deliberately replaced with a scoped sweep of credential-bearing locations.
+Run it elevated. See the elevation section above for what you lose otherwise.
 
-## Repo layout
+## Handle the reports carefully
+
+Reports enumerate credential-adjacent material: paths, account names, exclusion lists, listening services. Secret values are redacted, but the reports still describe your attack surface in detail. Treat them as evidence rather than as logs. The supplied `.gitignore` excludes report artifacts for that reason.
+
+> **`-EncryptKey` is not strong cryptography.** It derives the AES key by space-padding the passphrase to 32 bytes with no key-derivation function, and it uses a fixed IV. It will stop a report being read by someone casually browsing a share. It will not stop an attacker who wants the contents. If you need real protection for reports at rest, use something else.
+
+## Building from source
+
+The shipped script is one self-contained file assembled from `parts/`:
+
+```powershell
+pwsh -File build.ps1
+```
+
+`build.ps1` concatenates the parts in an explicit order, verifies the result parses, strips comments with the PowerShell AST tokenizer (so `#` inside strings and regexes survives), then re-verifies.
 
 ```
-BlueWinPEAS.ps1    the tool (single file, self-contained)
-parts/          source modules in execution order (10_header ... 99_summary)
-                cat parts/*.ps1 in filename order == BlueWinPEAS.ps1
+WinHostPEAS.ps1   the tool: single file, self-contained, no dependencies
+build.ps1         assembles parts/ into the shipped script
+parts/            source modules
 ```
 
-Edit `parts/`, reassemble with `cat parts/10_header.ps1 parts/11_findings.ps1 parts/12_helpers.ps1 parts/03_adfuncs.ps1 parts/13_secrets.ps1 parts/20_system.ps1 parts/21_creds.ps1 parts/22_privesc.ps1 parts/23_network.ps1 parts/24_ad_software.ps1 parts/25_ot_discovery.ps1 parts/26_service_inventory.ps1 parts/27_loopback.ps1 parts/28_iis.ps1 parts/29_os_vulns.ps1 parts/30_hardening.ps1 parts/99_summary.ps1 > BlueWinPEAS.ps1`.
+Two notes for contributors. The assembly order in `build.ps1` is an explicit list, so a new part file that is not added to it will silently never ship. And `parts/04_installedapps.ps1` and `parts/05_regex.ps1` are inherited dead code, deliberately excluded from the build.
 
 ## Extending
 
-- **MAC OUI table**: `parts/25_ot_discovery.ps1` — `$ouiMap` (partial by design; extend with your fleet's vendors)
-- **Port dictionary**: `parts/26_service_inventory.ps1` — `$portMap`
-- **BMS vendor dictionary**: `parts/26_service_inventory.ps1` — `$otVendors`
-- **Secret patterns**: `parts/13_secrets.ps1` — `Get-SecretPatterns`
-- **Banner-grab ports**: `parts/26_service_inventory.ps1` — `$bannerPorts`
+| What | Where |
+|---|---|
+| MAC OUI table | `parts/25_ot_discovery.ps1`, `$ouiMap` |
+| Port dictionary | `parts/26_service_inventory.ps1`, `$portMap` |
+| BMS vendor dictionary | `parts/26_service_inventory.ps1`, `$otVendors` |
+| Secret patterns | `parts/13_secrets.ps1`, `Get-SecretPatterns` |
+| Obfuscation indicators | `parts/33_advanced.ps1`, `$script:ObfPattern` |
 
 ## Legal
 
-For use only on systems you own or are explicitly authorized to audit. Derived from PEASS-ng's winPEAS (original: https://github.com/peass-ng/PEASS-ng, © PEASS-ng / @RandolphConley) — defensive modifications only.
+For use only on systems you own or are explicitly authorized to audit. Derived from PEASS-ng's winPEAS (https://github.com/peass-ng/PEASS-ng, (c) PEASS-ng / @RandolphConley); defensive modifications only.
