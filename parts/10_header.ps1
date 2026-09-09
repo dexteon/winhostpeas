@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  BluePEAS - the winPEAS.ps1 enumeration engine refit as a BLUE TEAM posture audit.
+  BlueWinPEAS - the winPEAS.ps1 enumeration engine refit as a BLUE TEAM posture audit.
 .DESCRIPTION
   Same detection surface an attacker would enumerate, repurposed for defenders:
     - structured findings (Severity / Category / Title / Detail / Remediation)
@@ -12,9 +12,9 @@
     - emits JSON + CSV + HTML reports for ticketing / compliance pipelines
   Read-only: changes nothing on the host. Produces no exploit instructions.
 .EXAMPLE
-  .\BluePEAS.ps1                     # fast posture audit + reports
-  .\BluePEAS.ps1 -FullCheck          # + deep (redacted) secret-pattern sweep
-  .\BluePEAS.ps1 -OutputDir C:\Audits -TimeStamp
+  .\BlueWinPEAS.ps1                     # fast posture audit + reports
+  .\BlueWinPEAS.ps1 -FullCheck          # + deep (redacted) secret-pattern sweep
+  .\BlueWinPEAS.ps1 -OutputDir C:\Audits -TimeStamp
 .NOTES
   Derived from winPEAS.ps1 v1.3 (PEASS-ng / @RandolphConley), defensive refit.
   Run only on systems you own or are explicitly authorized to audit.
@@ -24,8 +24,9 @@
 param(
   [switch]$TimeStamp,
   [switch]$FullCheck,
-  [string]$OutputDir = '.\BluePEAS_Output',
-  [switch]$NoReport
+  [string]$OutputDir = '.\BlueWinPEAS_Output',
+  [switch]$NoReport,
+  [switch]$NoLaunch
 )
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
