@@ -47,7 +47,6 @@ pwsh -File WinHostPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStam
 | `-NoReport` | Console only, no files written |
 | `-NoLaunch` | Do not open the HTML dashboard; use this for unattended runs |
 | `-Obfuscate` | Randomized report filenames and a generic tool label |
-| `-EncryptKey <str>` | AES-encrypts the reports. Read the warning below before relying on it. |
 
 Reference runtimes on a Windows 11 workstation: about 35 seconds by default, about 2 minutes with `-FullCheck`.
 
@@ -154,7 +153,7 @@ Run it elevated. See the elevation section above for what you lose otherwise.
 
 Reports enumerate credential-adjacent material: paths, account names, exclusion lists, listening services. Secret values are redacted, but the reports still describe your attack surface in detail. Treat them as evidence rather than as logs. The supplied `.gitignore` excludes report artifacts for that reason.
 
-> **`-EncryptKey` is not strong cryptography.** It derives the AES key by space-padding the passphrase to 32 bytes with no key-derivation function, and it uses a fixed IV. It will stop a report being read by someone casually browsing a share. It will not stop an attacker who wants the contents. If you need real protection for reports at rest, use something else.
+The tool deliberately offers no encryption of its own. Report protection belongs to the storage layer, where it can be done properly: write to a share with real access controls, or to a BitLocker or EFS-protected volume. A passphrase switch bolted onto a scanner invites people to trust it more than it deserves.
 
 ## Building from source
 
