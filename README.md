@@ -1,8 +1,8 @@
-# BluePEAS
+# BlueWinPEAS
 
-**A blue-team refit of winPEAS.ps1 — the attacker's local enumeration engine, rebuilt as a defensive posture-audit tool for Windows and BMS/OT hosts.**
+**A blue-team refit of winPEAS.ps1 — the attacker's local enumeration engine, rebuilt as a full defensive vulnerability-recon tool for Windows Server 2019/2022/2025 and Windows 10/11, including IIS and IIS Rewrite deep recon.**
 
-BluePEAS keeps the detection surface an attacker would enumerate against a host, but repurposes every check for defenders: structured findings with severity and remediation instead of exploit instructions, secret *detection* instead of secret *exfiltration*, OT-safe network discovery, and JSON/CSV/HTML reports built for unattended fleet runs.
+BlueWinPEAS keeps the detection surface an attacker would enumerate against a host, but repurposes every check for defenders: structured findings with severity and remediation instead of exploit instructions, secret *detection* instead of secret *exfiltration*, OT-safe network discovery, and JSON/CSV/HTML reports built for unattended fleet runs.
 
 Derived from [winPEAS.ps1 v1.3](https://github.com/peass-ng/PEASS-ng) (PEASS-ng / @RandolphConley). Original tooling preserved nowhere in this repo — this is the defensive fork.
 
@@ -10,9 +10,9 @@ Derived from [winPEAS.ps1 v1.3](https://github.com/peass-ng/PEASS-ng) (PEASS-ng 
 
 ## Why
 
-winPEAS answers *"how would I escalate from here?"* BluePEAS answers *"what would an attacker find if they landed on this host, and how do I fix it before they do?"* Same enumeration surface, opposite posture:
+winPEAS answers *"how would I escalate from here?"* BlueWinPEAS answers *"what would an attacker find if they landed on this host, and how do I fix it before they do?"* Same enumeration surface, opposite posture:
 
-| | winPEAS.ps1 | BluePEAS |
+| | winPEAS.ps1 | BlueWinPEAS |
 |---|---|---|
 | Output | Raw console dump | 252+ structured findings (Severity/Category/Remediation) |
 | Secrets | Prints passwords, WiFi keys, clipboard, DPAPI blobs | Detects + **redacts** — values never reach console or reports |
@@ -23,16 +23,16 @@ winPEAS answers *"how would I escalate from here?"* BluePEAS answers *"what woul
 | Unattended | No | Exit code = Critical+High count for fleet triage |
 | Runtime (typical) | 30–60+ min full-drive regex crawl | ~2 min default, ~6 min `-FullCheck` |
 
-Both were run side-by-side on the same host during development. winPEAS required a manual Defender exclusion to execute; BluePEAS ran clean with realtime protection on.
+Both were run side-by-side on the same host during development. winPEAS required a manual Defender exclusion to execute; BlueWinPEAS ran clean with realtime protection on.
 
 ## Usage
 
 ```powershell
 # Fast posture audit (default) - ~2 minutes
-pwsh -File BluePEAS.ps1 -OutputDir .\BluePEAS_Output
+pwsh -File BlueWinPEAS.ps1 -OutputDir .\BlueWinPEAS_Output
 
 # Deep run: adds scoped secret-pattern sweep + full inventory - ~6 minutes
-pwsh -File BluePEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStamp
+pwsh -File BlueWinPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStamp
 
 # Unattended fleet: exit code = Critical+High finding count (capped 250)
 # schedule via GPO/SCCM/Intune/PDQ; centralize reports on a UNC path
@@ -43,11 +43,11 @@ Parameters:
 | Switch | Effect |
 |---|---|
 | `-FullCheck` | Adds deep (redacted) secret-pattern sweep of credential-bearing dirs + registry areas |
-| `-OutputDir <path>` | Report destination (default `.\BluePEAS_Output`) — use UNC for fleet centralization |
+| `-OutputDir <path>` | Report destination (default `.\BlueWinPEAS_Output`) — use UNC for fleet centralization |
 | `-TimeStamp` | Per-section elapsed-time stamps |
 | `-NoReport` | Console only, no files written |
 
-Read-only: BluePEAS changes nothing on the host.
+Read-only: BlueWinPEAS changes nothing on the host.
 
 ## Feature writeup
 
@@ -89,11 +89,17 @@ Passwordless local accounts (Critical), minimum password length, never-expiring 
 ### 12. Patch posture
 Hotfix recency (60-day staleness = High), pending-reboot detection (patched-but-not-finalized CVE exposure).
 
+### 13. IIS / web-server recon (Server 2019/2022, Win10/11 with IIS)
+Full read-only IIS inventory via Microsoft.Web.Administration: sites + bindings (HTTP-only sites flagged Medium), app pools (identity — LocalSystem pools are High; legacy .NET 2.0 runtimes; 32-bit flags), web-root writability checks (writable root = webshell drop-in, High). Certificate store audit: expired certs (Critical), expiring <30d, weak MD5/SHA1 signatures. **IIS URL Rewrite module**: version check against known-fixed builds (2.1.2105+), stale-build advisory flag. web.config sweep across every site root + inetpub: plaintext DB passwords in connection strings (High), weak machineKey validation/short validationKey (ViewState forgery path, High), directoryBrowse enabled, `retail=false`, plus the full secret-pattern scan. applicationHost.config: Basic-auth-over-HTTP, anonymous auth inventory, password-shaped values, and a Critical if the file itself is user-writable (= total IIS takeover). IIS FTP/SMTP service presence. WinRM: HTTP-listener and AllowUnencrypted/Basic-auth checks.
+
+### 14. OS vulnerability / crypto surface
+OS build + end-of-support table (Server 2008–2025, Win10/11) with EOL = Critical and <1-year = Medium; Windows 11 feature-update currency (24H2=26100). TLS protocol inventory from SCHANNEL (SSLv2/3, TLS 1.0/1.1 active = High; TLS 1.2/1.3 presence confirmed), enabled cipher-suite audit (NULL/RC4/3DES = Medium), FIPS status. SMBv1 (Critical) + SMB signing server/client. .NET Framework version (pre-4.7 = Medium), legacy v2/v3.x runtimes, SchUseStrongCrypto machine.config gap. Legacy optional features (PowerShellv2, Telnet/TFTP clients, SMB1, NetFx3). secedit policy baseline: password minimum length, lockout threshold, anonymous SAM lookup. RDP encryption level + SecurityLayer. bcdedit testsigning/nointegritychecks (unsigned driver = rootkit path, High).
+
 ## Unattended fleet deployment
 
-1. Copy `BluePEAS.ps1` to a share or push via your deployment tool.
-2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\BluePEAS.ps1 -OutputDir \\server\share\BluePEAS -FullCheck`
-3. Each host writes `BluePEAS_<HOST>_<timestamp>.{json,csv,html}`.
+1. Copy `BlueWinPEAS.ps1` to a share or push via your deployment tool.
+2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\BlueWinPEAS.ps1 -OutputDir \\server\share\BlueWinPEAS -FullCheck`
+3. Each host writes `BlueWinPEAS_<HOST>_<timestamp>.{json,csv,html}`.
 4. Triage by exit code: 0 = no Critical/High; N = N Critical/High findings; or ingest the JSONs into your SIEM/CMDB (stable schema, one array of finding objects).
 
 Runtime on a typical BMS box: ~2 min default, ~6 min `-FullCheck`. The slow winPEAS full-drive crawl was deliberately replaced with a scoped sweep of credential-bearing locations.
@@ -101,12 +107,12 @@ Runtime on a typical BMS box: ~2 min default, ~6 min `-FullCheck`. The slow winP
 ## Repo layout
 
 ```
-BluePEAS.ps1    the tool (single file, self-contained)
+BlueWinPEAS.ps1    the tool (single file, self-contained)
 parts/          source modules in execution order (10_header ... 99_summary)
-                cat parts/*.ps1 in filename order == BluePEAS.ps1
+                cat parts/*.ps1 in filename order == BlueWinPEAS.ps1
 ```
 
-Edit `parts/`, reassemble with `cat parts/10_header.ps1 parts/11_findings.ps1 parts/12_helpers.ps1 parts/03_adfuncs.ps1 parts/13_secrets.ps1 parts/20_system.ps1 parts/21_creds.ps1 parts/22_privesc.ps1 parts/23_network.ps1 parts/24_ad_software.ps1 parts/25_ot_discovery.ps1 parts/26_service_inventory.ps1 parts/27_loopback.ps1 parts/99_summary.ps1 > BluePEAS.ps1`.
+Edit `parts/`, reassemble with `cat parts/10_header.ps1 parts/11_findings.ps1 parts/12_helpers.ps1 parts/03_adfuncs.ps1 parts/13_secrets.ps1 parts/20_system.ps1 parts/21_creds.ps1 parts/22_privesc.ps1 parts/23_network.ps1 parts/24_ad_software.ps1 parts/25_ot_discovery.ps1 parts/26_service_inventory.ps1 parts/27_loopback.ps1 parts/28_iis.ps1 parts/29_os_vulns.ps1 parts/99_summary.ps1 > BlueWinPEAS.ps1`.
 
 ## Extending
 

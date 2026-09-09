@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  BluePEAS - the winPEAS.ps1 enumeration engine refit as a BLUE TEAM posture audit.
+  BlueWinPEAS - the winPEAS.ps1 enumeration engine refit as a BLUE TEAM posture audit.
 .DESCRIPTION
   Same detection surface an attacker would enumerate, repurposed for defenders:
     - structured findings (Severity / Category / Title / Detail / Remediation)
@@ -12,9 +12,9 @@
     - emits JSON + CSV + HTML reports for ticketing / compliance pipelines
   Read-only: changes nothing on the host. Produces no exploit instructions.
 .EXAMPLE
-  .\BluePEAS.ps1                     # fast posture audit + reports
-  .\BluePEAS.ps1 -FullCheck          # + deep (redacted) secret-pattern sweep
-  .\BluePEAS.ps1 -OutputDir C:\Audits -TimeStamp
+  .\BlueWinPEAS.ps1                     # fast posture audit + reports
+  .\BlueWinPEAS.ps1 -FullCheck          # + deep (redacted) secret-pattern sweep
+  .\BlueWinPEAS.ps1 -OutputDir C:\Audits -TimeStamp
 .NOTES
   Derived from winPEAS.ps1 v1.3 (PEASS-ng / @RandolphConley), defensive refit.
   Run only on systems you own or are explicitly authorized to audit.
@@ -24,7 +24,7 @@
 param(
   [switch]$TimeStamp,
   [switch]$FullCheck,
-  [string]$OutputDir = '.\BluePEAS_Output',
+  [string]$OutputDir = '.\BlueWinPEAS_Output',
   [switch]$NoReport
 )
 
@@ -103,12 +103,12 @@ function Write-Reports {
   if ($NoReport) { return }
   try { New-Item -ItemType Directory -Path $Dir -Force | Out-Null } catch { Write-Host "Cannot create report dir: $_" -ForegroundColor Red; return }
   $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $json = Join-Path $Dir ("BluePEAS_{0}_{1}.json" -f $env:COMPUTERNAME, $stamp)
-  $csv  = Join-Path $Dir ("BluePEAS_{0}_{1}.csv"  -f $env:COMPUTERNAME, $stamp)
-  $html = Join-Path $Dir ("BluePEAS_{0}_{1}.html" -f $env:COMPUTERNAME, $stamp)
+  $json = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.json" -f $env:COMPUTERNAME, $stamp)
+  $csv  = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.csv"  -f $env:COMPUTERNAME, $stamp)
+  $html = Join-Path $Dir ("BlueWinPEAS_{0}_{1}.html" -f $env:COMPUTERNAME, $stamp)
 
   $meta = [pscustomobject]@{
-    Tool        = 'BluePEAS (defensive refit of winPEAS.ps1)'
+    Tool        = 'BlueWinPEAS (defensive refit of winPEAS.ps1)'
     Host        = $env:COMPUTERNAME
     Generated   = (Get-Date).ToString('s')
     Duration    = $stopwatch.Elapsed.ToString('mm\:ss')
@@ -129,7 +129,7 @@ function Write-Reports {
   }
   $counts = $script:Findings | Group-Object Severity | ForEach-Object { $_.Name + ': ' + $_.Count }
   $htmlDoc = @"
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>BluePEAS Report - $($env:COMPUTERNAME)</title>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
 <style>
  body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f8fafc;color:#111827}
  h1{margin-bottom:0} .meta{color:#6b7280;margin-bottom:16px}
@@ -141,7 +141,7 @@ function Write-Reports {
  .Medium{background:#fef3c7}.Low{background:#e0f2fe}.Info{background:#f3f4f6}
  code{font-size:11px;word-break:break-all}
 </style></head><body>
-<h1>BluePEAS Posture Audit</h1>
+<h1>BlueWinPEAS Posture Audit</h1>
 <div class="meta">Host: $($env:COMPUTERNAME) &middot; $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; `$joinCountsPlaceholder`</div>
 <table><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Detail</th><th>Evidence</th><th>Remediation</th></tr>
 `$rowsPlaceholder`
@@ -1736,6 +1736,489 @@ if ($proxyOverride -match 'localhost|127\.') {
   Add-Finding -Severity Info -Category 'Loopback' -Title 'Proxy bypass includes localhost (standard config)'
 }
 
+######################## IIS / WEB SERVER RECON ########################
+# Deep IIS inventory when IIS is present (Server 2019/Win11): sites, bindings,
+# app pools, certificates, web.config secrets, IIS Rewrite module, auth, TLS.
+# All checks are read-only (ServerManager API + config files).
+
+Start-Section 'IIS WEB SERVER RECON'
+$iisPresent = $false
+$sm = $null
+$adminDll = "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll"
+if ((Get-Service W3SVC -ErrorAction SilentlyContinue) -or (Test-Path $adminDll)) {
+  $iisPresent = $true
+  try {
+    [void][System.Reflection.Assembly]::LoadFrom($adminDll)
+    $sm = New-Object Microsoft.Web.Administration.ServerManager
+  } catch { $sm = $null }
+}
+
+if (-not $iisPresent) {
+  Add-Finding -Severity Info -Category 'IIS' -Title 'IIS not installed on this host'
+}
+else {
+  Add-Finding -Severity Info -Category 'IIS' -Title 'IIS is installed' `
+    -Detail 'Full web-server recon follows - every finding is attacker-recon surface.'
+
+  # --- IIS version ---
+  $iisVer = (Get-Item "$env:windir\System32\inetsrv\w3wp.exe" -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+  if ($iisVer) { Add-Finding -Severity Info -Category 'IIS' -Title "IIS engine version $iisVer" }
+
+  # --- Sites & bindings ---
+  if ($sm) {
+    foreach ($site in $sm.Sites) {
+      $bindings = ($site.Bindings | ForEach-Object {
+        '{0}://{1}:{2}' -f $_.Protocol, $(if ($_.Host) { $_.Host } else { '*' }), $_.BindingInformation.Split(':')[-1]
+      }) -join ', '
+      Add-Finding -Severity Info -Category 'IIS' -Title ("Site '{0}' ({1})" -f $site.Name, $site.State) `
+        -Detail ("Bindings: {0} | ID: {1}" -f $bindings, $site.Id) `
+        -Remediation 'Baseline expected bindings; unknown sites = investigate.'
+      # HTTP-only site (no TLS binding)
+      if (-not ($site.Bindings | Where-Object { $_.Protocol -eq 'https' })) {
+        Add-Finding -Severity Medium -Category 'IIS' -Title ("Site '{0}' has NO HTTPS binding" -f $site.Name) `
+          -Detail 'Cleartext HTTP - credentials/cookies/session tokens readable on the wire.' `
+          -Remediation 'Add an HTTPS binding with a valid cert; redirect HTTP to HTTPS; set HSTS.'
+      }
+      # Physical path + writability check
+      foreach ($app in $site.Applications) {
+        $root = $app.VirtualDirectories | Select-Object -First 1
+        if ($root -and $root.PhysicalPath -and (Test-Path $root.PhysicalPath)) {
+          $acl = Get-Acl $root.PhysicalPath -ErrorAction SilentlyContinue
+          if ($acl) {
+            $w = $acl.Access | Where-Object {
+              $_.IdentityReference -match 'BUILTIN\\Users|Everyone|IIS_IUSRS' -and
+              $_.AccessControlType -eq 'Allow' -and "$($_.FileSystemRights)" -match 'FullControl|Modify|Write'
+            }
+            if ($w) {
+              Add-Finding -Severity High -Category 'IIS' -Title ("Web root writable by non-admin: {0}" -f $root.PhysicalPath) `
+                -Detail ("Site: {0} | {1} granted {2} - webshell drop-in." -f $site.Name, $w[0].IdentityReference, $w[0].FileSystemRights) `
+                -Remediation 'Web roots should be read-only for app-pool identities and Users; writers need explicit ACLs.'
+            }
+          }
+        }
+      }
+    }
+
+    # --- App pools ---
+    foreach ($pool in $sm.ApplicationPools) {
+      $ident = $pool.ProcessModel.IdentityType
+      $flags = @()
+      if ($pool.Enable32BitAppOnWin64) { $flags += '32bit' }
+      if ($pool.ProcessModel.LoadUserProfile -eq $false) { $flags += 'no-profile' }
+      Add-Finding -Severity Info -Category 'IIS' -Title ("App pool '{0}' ({1})" -f $pool.Name, $pool.State) `
+        -Detail ("Identity: {0} | .NET CLR: {1}{2}" -f $ident, $pool.ManagedRuntimeVersion, $(if ($flags) { ' | ' + ($flags -join ',') } else { '' }))
+      if ("$ident" -match 'LocalSystem') {
+        Add-Finding -Severity High -Category 'IIS' -Title ("App pool '{0}' runs as LocalSystem" -f $pool.Name) `
+          -Detail 'Any app-level RCE/LFI in that pool = full SYSTEM compromise.' `
+          -Remediation 'Use ApplicationPoolIdentity; grant precise per-pool resource ACLs.'
+      }
+      if ($pool.ManagedRuntimeVersion -eq 'v2.0') {
+        Add-Finding -Severity Medium -Category 'IIS' -Title ("App pool '{0}' targets .NET 2.0/3.5 runtime" -f $pool.Name) `
+          -Remediation 'Migrate to v4.x; legacy runtime lacks modern mitigations.'
+      }
+    }
+  }
+
+  # --- Machine certificates: expiry / weak keys (covers HTTPS bindings) ---
+  try {
+    $now = Get-Date
+    foreach ($cert in (Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue)) {
+      $days = ($cert.NotAfter - $now).Days
+      $subj = $cert.Subject -replace '^CN=', ''
+      if ($days -lt 0) {
+        Add-Finding -Severity Critical -Category 'IIS' -Title ("EXPIRED certificate: {0} (expired {1}d ago)" -f $subj, -$days) `
+          -Detail ('Thumbprint: ' + $cert.Thumbprint) `
+          -Remediation 'Renew now - expired certs break TLS and push users to click-through errors.'
+      }
+      elseif ($days -lt 30) {
+        Add-Finding -Severity Medium -Category 'IIS' -Title ("Certificate expiring in {0}d: {1}" -f $days, $subj) `
+          -Detail ('Thumbprint: ' + $cert.Thumbprint) `
+          -Remediation 'Schedule renewal.'
+      }
+      if ($cert.SignatureAlgorithm.FriendlyName -match 'MD5|SHA1') {
+        Add-Finding -Severity Medium -Category 'IIS' -Title ("Weak signature ({0}) on cert: {1}" -f $cert.SignatureAlgorithm.FriendlyName, $subj) `
+          -Remediation 'Reissue with SHA256+.'
+      }
+    }
+  } catch { }
+
+  # --- IIS URL Rewrite module ---
+  $rewriteDll = "$env:windir\System32\inetsrv\rewrite.dll"
+  if (Test-Path $rewriteDll) {
+    $rv = (Get-Item $rewriteDll).VersionInfo
+    $rver = '{0}.{1}.{2}.{3}' -f $rv.FileMajorPart, $rv.FileMinorPart, $rv.FileBuildPart, $rv.FilePrivatePart
+    Add-Finding -Severity Info -Category 'IIS' -Title ("IIS URL Rewrite module installed: v{0}" -f $rver) `
+      -Detail 'Rewrite is internet-reachable logic: inbound/outbound rules in web.config can leak or redirect.'
+    $fileVerNum = [double]('{0}.{1}' -f $rv.FileMajorPart, $rv.FileMinorPart)
+    $buildNum = [int]$rv.FileBuildPart
+    if ($fileVerNum -lt 2.1 -or ($fileVerNum -eq 2.1 -and $buildNum -lt 2105)) {
+      Add-Finding -Severity Medium -Category 'IIS' -Title ("IIS URL Rewrite v{0} is outdated" -f $rver) `
+        -Detail 'Older Rewrite 2.x builds have published security fixes (e.g. spoofing/info-disclosure class advisories).' `
+        -Remediation 'Upgrade to the latest URL Rewrite 2.1 from Microsoft; verify against the advisory list.'
+    }
+    # Rewrite rules referenced in web.configs get scanned below with the file sweep
+  }
+  else {
+    Add-Finding -Severity Info -Category 'IIS' -Title 'IIS URL Rewrite module not installed'
+  }
+
+  # --- web.config secrets & weak machineKey settings ---
+  $webRoots = @("$env:windir\System32\inetsrv\config", "$env:SystemDrive\inetpub")
+  if ($sm) {
+    foreach ($site in $sm.Sites) {
+      foreach ($app in $site.Applications) {
+        $root = $app.VirtualDirectories | Select-Object -First 1
+        if ($root -and $root.PhysicalPath) { $webRoots += $root.PhysicalPath }
+      }
+    }
+  }
+  $webRoots = $webRoots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+  foreach ($wr in $webRoots) {
+    $cfgFiles = @(Get-ChildItem -LiteralPath $wr -Recurse -Filter 'web.config' -ErrorAction SilentlyContinue | Select-Object -First 50)
+    foreach ($cfg in $cfgFiles) {
+      $content = $null
+      try { $content = Get-Content $cfg.FullName -Raw -ErrorAction SilentlyContinue } catch { }
+      if (-not $content) { continue }
+      # connection strings with passwords (redacted)
+      if ($content -match '(?i)connectionstring\s*=.{0,200}password\s*=') {
+        Add-Finding -Severity High -Category 'IIS' -Title ("Plaintext DB password in {0}" -f $cfg.FullName) `
+          -Detail 'Detected via pattern; value not recorded.' `
+          -Remediation 'Move to encrypted connectionStrings sections or managed identities.'
+      }
+      # machineKey weak/validation
+      if ($content -match '(?i)<machinekey[^>]*validation\s*=\s*"(MD5|SHA1|3DES|AES"[^"]*"?)') {
+        Add-Finding -Severity High -Category 'IIS' -Title ("Weak machineKey validation in {0}" -f $cfg.FullName) `
+          -Detail 'MD5/SHA1/3DES ViewState signing is forgeable - ViewState deserialization RCE path.' `
+          -Remediation 'Use HMACSHA256 validation; rotate autoGenerated keys.'
+      }
+      if ($content -match '(?i)<machinekey[^>]*validationkey\s*=\s*"([0-9A-Fa-f]{10,60})"') {
+        Add-Finding -Severity High -Category 'IIS' -Title ("Short/weak validationKey in {0}" -f $cfg.FullName) `
+          -Detail 'Explicit short validationKey is brute-forceable, enabling ViewState forgery.' `
+          -Remediation 'Use 64-128 hex byte autoGenerated keys.'
+      }
+      # debug=true exposed
+      if ($content -match '(?i)<deployment[^>]*retail\s*=\s*"false"') {
+        Add-Finding -Severity Low -Category 'IIS' -Title ("deployment retail=false in {0}" -f $cfg.FullName) `
+          -Remediation 'Set retail="true" on production servers (kills debug tracing + detailed errors).'
+      }
+      # directory browsing on
+      if ($content -match '(?i)<directorybrowse[^>]*enabled\s*=\s*"true"') {
+        Add-Finding -Severity Medium -Category 'IIS' -Title ("Directory browsing enabled in {0}" -f $cfg.FullName) `
+          -Remediation 'Disable directoryBrowse - leaks file inventory to attackers.'
+      }
+      # generic secret patterns
+      Test-FileForSecrets -Path $cfg.FullName -Context ' (IIS web.config)'
+    }
+  }
+
+  # --- Server-level auth config from applicationHost.config ---
+  $appHost = "$env:windir\System32\inetsrv\config\applicationHost.config"
+  if (Test-Path $appHost) {
+    $ah = $null
+    try { $ah = Get-Content $appHost -Raw } catch { }
+    if ($ah) {
+      if ($ah -match '(?i)<anonymousAuthentication[^>]*enabled\s*=\s*"true"') {
+        Add-Finding -Severity Low -Category 'IIS' -Title 'Anonymous authentication enabled (server-wide default)' `
+          -Remediation 'Expected for public sites; ensure protected vdirs override with auth.'
+      }
+      if ($ah -match '(?i)<basicAuthentication[^>]*enabled\s*=\s*"true"') {
+        Add-Finding -Severity Medium -Category 'IIS' -Title 'Basic authentication enabled in IIS' `
+          -Detail 'Base64 cleartext credentials on the wire unless bound to TLS.' `
+          -Remediation 'Require HTTPS on all Basic-auth bindings or move to Windows/auth modes.'
+      }
+      if ($ah -match '(?i)<directoryBrowse[^>]*enabled\s*=\s*"true"') {
+        Add-Finding -Severity Medium -Category 'IIS' -Title 'Directory browsing enabled at server level'
+      }
+      # applicationHost.config itself: connection strings / passwords
+      if ($ah -match '(?i)password\s*=') {
+        Add-Finding -Severity High -Category 'IIS' -Title 'Password-shaped value in applicationHost.config' `
+          -Detail 'App-pool/service credentials stored in config are readable by admins and backup-exfiltration.' `
+          -Remediation 'Use app-pool identities where possible; protect config backups.'
+      }
+    }
+    # writable applicationHost.config = total IIS takeover
+    $aclAh = Get-Acl $appHost -ErrorAction SilentlyContinue
+    if ($aclAh) {
+      $weakAh = $aclAh.Access | Where-Object {
+        $_.IdentityReference -match 'BUILTIN\\Users|Everyone' -and $_.AccessControlType -eq 'Allow' -and
+        ("$($_.FileSystemRights)" -match 'FullControl|Modify|Write')
+      }
+      if ($weakAh) {
+        Add-Finding -Severity Critical -Category 'IIS' -Title 'applicationHost.config is user-writable' `
+          -Detail 'Edit = full control of every site/app pool on the box.' `
+          -Remediation 'Restore Administrators/SYSTEM/Administrators-only ACL immediately.'
+      }
+    }
+  }
+
+  # --- Other web-adjacent services ---
+  foreach ($svc in @(@('FTPSVC', 'IIS FTP'), @('SMTPSVC', 'IIS SMTP'))) {
+    $s = Get-Service $svc[0] -ErrorAction SilentlyContinue
+    if ($s -and $s.Status -eq 'Running') {
+      Add-Finding -Severity Low -Category 'IIS' -Title ("{0} service running" -f $svc[1]) `
+        -Remediation 'Confirm business need; FTP/SMTP legacy services widen attack surface (cleartext protocols).'
+    }
+  }
+}
+
+# --- WinRM transport security (IIS-adjacent remote mgmt) ---
+try {
+  $listeners = Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop | Get-Item
+  foreach ($l in $listeners) {
+    $tr = $l.ChildKeys | Where-Object { $_ }
+    $transport = (Get-ChildItem $l.PSPath -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Transport' })
+    $tval = if ($transport) { $transport.Value } else { 'HTTP' }
+    $portItem = Get-ChildItem $l.PSPath -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Port' }
+    Add-Finding -Severity Info -Category 'RemoteMgmt' -Title ("WinRM listener ({0}, port {1})" -f $tval, $portItem.Value)
+    if ("$tval" -eq 'HTTP') {
+      Add-Finding -Severity Medium -Category 'RemoteMgmt' -Title 'WinRM listener on HTTP (unencrypted transport)' `
+        -Remediation 'Add an HTTPS listener (or use trusted host + NTLMnegotiate); ideally HTTPS-only.'
+    }
+  }
+  $unenc = (Get-Item WSMan:\localhost\Service\Auth\Basic -ErrorAction SilentlyContinue).Value
+  $allowUnenc = (Get-Item WSMan:\localhost\Service\AllowUnencrypted -ErrorAction SilentlyContinue).Value
+  if ("$allowUnenc" -eq 'true') {
+    Add-Finding -Severity High -Category 'RemoteMgmt' -Title 'WinRM AllowUnencrypted = true' `
+      -Remediation 'Set to false; unencrypted WinRM exposes credentials to on-path capture.'
+  }
+  if ("$unenc" -eq 'true') {
+    Add-Finding -Severity Medium -Category 'RemoteMgmt' -Title 'WinRM Basic auth enabled' `
+      -Remediation 'Prefer Kerberos/Negotiate; Basic over HTTP is trivially sniffable.'
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM not configured on this host'
+}
+
+######################## OS VULNERABILITY / CRYPTO / EOL SURFACE ########################
+# OS-level vulnerability surface for Server 2019/2022 and Win10/11:
+# OS EOL, TLS protocol inventory, cipher suites, SMB dialects, RDP encryption,
+# .NET/edge/legacy runtime inventory, LSA old behavior, secedit baseline dump.
+
+Start-Section 'OS VULNERABILITY SURFACE'
+
+# --- OS build + support status ---
+$osCim = Get-CimInstance Win32_OperatingSystem
+$osName = $osCim.Caption
+$build = [int]$osCim.BuildNumber
+Add-Finding -Severity Info -Category 'OS' -Title ("OS: {0} (build {1})" -f $osName, $build)
+$eolTable = @(
+  @{ Match = 'Server 2019';    EOL = [datetime]'2029-01-09' }
+  @{ Match = 'Server 2022';    EOL = [datetime]'2031-10-14' }
+  @{ Match = 'Server 2025';    EOL = [datetime]'2034-10-10' }
+  @{ Match = 'Server 2016';    EOL = [datetime]'2027-01-12' }
+  @{ Match = 'Server 2012';    EOL = [datetime]'2023-10-10' }
+  @{ Match = 'Windows 10';     EOL = [datetime]'2025-10-14' }
+  @{ Match = 'Windows 11';     EOL = [datetime]'2028-10-10' }
+)
+foreach ($e in $eolTable) {
+  if ($osName -like "*$($e.Match)*") {
+    if ((Get-Date) -gt $e.EOL) {
+      Add-Finding -Severity Critical -Category 'OS' -Title ("{0} is PAST END OF SUPPORT ({1:yyyy-MM-dd})" -f $osName, $e.EOL) `
+        -Detail 'No security patches - every future CVE is permanent.' `
+        -Remediation 'Plan migration/upgrade immediately; isolate the host meanwhile.'
+    }
+    elseif (((Get-Date) - $e.EOL).Days -gt -365) {
+      Add-Finding -Severity Medium -Category 'OS' -Title ("{0} support ends {1:yyyy-MM-dd} (<1 year)" -f $osName, $e.EOL) `
+        -Remediation 'Budget the upgrade now.'
+    }
+    else {
+      Add-Finding -Severity Info -Category 'OS' -Title ("{0} supported until {1:yyyy-MM-dd}" -f $osName, $e.EOL)
+    }
+    break
+  }
+}
+# Win11 Pro build currency check (24H2 = 26100)
+if ($osName -like '*Windows 11*' -and $build -lt 26100) {
+  Add-Finding -Severity Medium -Category 'OS' -Title ("Windows 11 build {0} is behind (24H2 = 26100)" -f $build) `
+    -Remediation 'Old Win11 builds fall out of servicing faster; update to the current feature update.'
+}
+
+# --- TLS protocol inventory (SSP Schannel enabled protocols) ---
+foreach ($hive in @('HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols')) {
+  $protos = @('SSL 2.0', 'SSL 3.0', 'TLS 1.0', 'TLS 1.1', 'TLS 1.2', 'TLS 1.3')
+  foreach ($p in $protos) {
+    $k = Join-Path $hive "$p\Server"
+    $enabled = (Get-ItemProperty $k -Name DisabledByDefault -ErrorAction SilentlyContinue).DisabledByDefault
+    $disabled = (Get-ItemProperty $k -Name Enabled -ErrorAction SilentlyContinue).Enabled
+    $active = if ($disabled -eq 0 -and $enabled -eq 1) { $true }
+              elseif ($null -eq $disabled -and $null -eq $enabled) {
+                # OS defaults: TLS1.2/1.3 on; older off on modern builds
+                if ($p -in 'TLS 1.2', 'TLS 1.3' -and $build -ge 17763) { $true }
+                elseif ($p -in 'TLS 1.2', 'TLS 1.3') { $false } else { $false }
+              } else { $false }
+    if ($active -and $p -match 'SSL|TLS 1\.0|TLS 1\.1') {
+      Add-Finding -Severity High -Category 'Crypto' -Title ("Weak protocol ACTIVE server-side: {0}" -f $p) `
+        -Detail 'SSL/TLS1.0/1.1 fail PCI/DISAGDSS baselines; downgrade attacks (POODLE/BAR-MITZVAH class).' `
+        -Remediation "Disable ${p} server and client side via SCHANNEL registry + reboot."
+    }
+  }
+}
+$activeProtos = @()
+foreach ($p in @('TLS 1.2', 'TLS 1.3')) {
+  $k = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$p\Server"
+  $dis = (Get-ItemProperty $k -Name DisabledByDefault -ErrorAction SilentlyContinue).DisabledByDefault
+  if ($dis -eq 0 -or $null -eq $dis) { $activeProtos += $p }
+}
+if ($activeProtos.Count -gt 0) {
+  Add-Finding -Severity Info -Category 'Crypto' -Title ("Modern TLS available: {0}" -f ($activeProtos -join ', '))
+} else {
+  Add-Finding -Severity High -Category 'Crypto' -Title 'No modern TLS protocol confirmed enabled' `
+    -Remediation 'Explicitly enable TLS 1.2/1.3 server-side.'
+}
+
+# --- Cipher suites: weak/NULL/RC4/3DES presence in the enabled list ---
+try {
+  $cs = Get-TlsCipherSuite -ErrorAction Stop | Select-Object -ExpandProperty Name
+  $weak = @($cs | Where-Object { $_ -match 'NULL|RC4|3DES|DES_' })
+  if ($weak.Count -gt 0) {
+    Add-Finding -Severity Medium -Category 'Crypto' -Title ("{0} weak cipher suites enabled" -f $weak.Count) `
+      -Detail (($weak | Select-Object -First 8) -join ', ') `
+      -Remediation 'Reorder/prune with Get-TlsCipherSuite | Disable-TlsCipherSuite; keep AEAD suites (GCM/ChaCha20).'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Crypto' -Title ("{0} cipher suites enabled, none weak" -f $cs.Count)
+  }
+} catch { }
+
+# --- FIPS mode ---
+$fips = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsPolicyGroup' -ErrorAction SilentlyContinue).Enabled
+$fips2 = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name FipsAlgorithmPolicy -ErrorAction SilentlyContinue
+Add-Finding -Severity Info -Category 'Crypto' -Title 'FIPS policy status recorded' `
+  -Detail ("FipsAlgorithmPolicy present: {0}" -f [bool]$fips2)
+
+# --- SMB client/server dialect floor ---
+try {
+  $srv = Get-SmbServerConfiguration -ErrorAction Stop
+  if ($srv.EnableSMB1Protocol) {
+    Add-Finding -Severity Critical -Category 'Crypto' -Title 'SMBv1 server enabled' `
+      -Detail 'EternalBlue/WannaCry class; no integrity or confidentiality.' `
+      -Remediation 'Set-SmbServerConfiguration -EnableSMB1Protocol $false'
+  }
+  if (-not $srv.RequireSecuritySignature) {
+    Add-Finding -Severity Medium -Category 'Crypto' -Title 'SMB signing not required (previously flagged; repeated in crypto context)'
+  }
+  $cli = Get-SmbClientConfiguration -ErrorAction SilentlyContinue
+  if ($cli -and $cli.EnableSecuritySignature -eq $false -and $cli.RequireSecuritySignature -eq $false) {
+    Add-Finding -Severity Medium -Category 'Crypto' -Title 'SMB client: signing neither enabled nor required' `
+      -Remediation 'Require SMB client signing via GPO (NTLM relay defense).'
+  }
+} catch { }
+
+# --- .NET framework inventory + strong-crypto opt-in ---
+$releaseKey = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+$netVer = if ($releaseKey) {
+  if ($releaseKey -ge 533320) { '4.8.1+' } elseif ($releaseKey -ge 528040) { '4.8' }
+  elseif ($releaseKey -ge 461808) { '4.7.2' } elseif ($releaseKey -ge 394802) { '4.6.2' } else { "4.x (release $releaseKey)" }
+} else { 'unknown' }
+Add-Finding -Severity Info -Category 'OS' -Title ".NET Framework: $netVer"
+if ($netVer -match '^4\.[0-6]' ) {
+  Add-Finding -Severity Medium -Category 'OS' -Title "Old .NET Framework ($netVer)" `
+    -Remediation 'Upgrade to 4.8.x - older runtimes miss TLS1.2 defaults and security fixes.'
+}
+foreach ($v2v35 in @('v2.0.50727', 'v3.0', 'v3.5')) {
+  if (Test-Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\$v2v35") {
+    Add-Finding -Severity Low -Category 'OS' -Title ".NET $v2v35 runtime present" `
+      -Remediation 'Remove if no apps depend on it (legacy attack surface).'
+  }
+}
+
+# --- Legacy/insecure optional features enabled ---
+try {
+  $feats = Get-WindowsOptionalFeature -Online -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' -and $_.FeatureName -match 'PowerShellV2|SMB1Protocol|TelnetClient|TFTPClient|NetFx3|IIS-.*Basicauth' }
+  foreach ($f in @($feats)) {
+    $sev = if ($f.FeatureName -match 'SMB1|PowerShellV2') { 'High' } else { 'Low' }
+    Add-Finding -Severity $sev -Category 'OS' -Title ("Legacy feature enabled: {0}" -f $f.FeatureName) `
+      -Remediation 'Disable-WindowsOptionalFeature -Online -FeatureName <name> - remove unless explicitly required (PowerShellv2 = downgrade attacks, SMB1 = wormable).'
+  }
+} catch { }
+
+# --- Depreciated crypto in .NET machine.config (SchUseStrongCrypto) ---
+foreach ($runtimeVer in @('v2.0.50727', 'v4.0.30319')) {
+  foreach ($bit in @('64', '32')) {
+    $mc = "$env:windir\Microsoft.NET\Framework$($bit)\$runtimeVer\CONFIG\machine.config"
+    $mcPath = $mc -replace 'Framework64', 'Framework'
+    if ($bit -eq '64') { $mcPath = $mc }
+    if (Test-Path $mcPath) {
+      $c = $null
+      try { $c = Get-Content $mcPath -Raw -ErrorAction SilentlyContinue } catch { }
+      if ($c -and $c -notmatch 'SchUseStrongCrypto"?\s*=\s*"?true' -and $runtimeVer -eq 'v4.0.30319') {
+        Add-Finding -Severity Low -Category 'Crypto' -Title "SchUseStrongCrypto not set in machine.config ($bit-bit)" `
+          -Detail 'Default .NET TLS defaults may allow weak protocol negotiation for legacy apps.' `
+          -Remediation 'Set SchUseStrongCrypto=true in machine.config / registry UseStrongCrypto=1.'
+      }
+    }
+  }
+}
+
+# --- Local security policy dump (secedit) - password/lockout baseline ---
+try {
+  $secOut = "$env:TEMP\bluepeas_secedit.cfg"
+  secedit /export /cfg $secOut /quiet 2>$null | Out-Null
+  if (Test-Path $secOut) {
+    $sec = Get-Content $secOut -ErrorAction SilentlyContinue
+    $pl = ($sec | Select-String 'MinimumPasswordLength').Line
+    if ($pl -match '=\s*(\d+)') {
+      $minLen = [int]$Matches[1]
+      if ($minLen -lt 14) {
+        Add-Finding -Severity Medium -Category 'OS' -Title ("Password policy: minimum length {0} (<14)" -f $minLen) `
+          -Remediation 'NIST/CIS: 14+ characters, length over complexity theater.'
+      }
+    }
+    $lock = ($sec | Select-String 'LockoutBadCount').Line
+    if ($lock -match '=\s*(\d+)') {
+      $lb = [int]$Matches[1]
+      if ($lb -eq 0) {
+        Add-Finding -Severity Medium -Category 'OS' -Title 'Account lockout threshold: 0 (never locks)' `
+          -Remediation 'Set lockout 5-10 attempts with timed reset (blocks brute force).'
+      }
+    }
+    $lba = ($sec | Select-String 'LsaAnonymousNameLookup').Line
+    if ($lba -match '=\s*1') {
+      Add-Finding -Severity Medium -Category 'OS' -Title 'Anonymous SAM/LSA lookup enabled' `
+        -Remediation 'Disable: LsaAnonymousNameLookup=0 (blocks null-session enumeration).'
+    }
+    $restrictAnon = ($sec | Select-String 'RestrictAnonymous(SAM)?\s*=').Line
+    Add-Finding -Severity Info -Category 'OS' -Title 'Secedit baseline exported (password/lockout/anonymous policy recorded)'
+    Remove-Item $secOut -Force -ErrorAction SilentlyContinue
+  }
+} catch { }
+
+# --- RDP encryption level (Terminal Server) ---
+$ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
+if ($ts) {
+  if ($ts.MinEncryptionLevel -lt 3) {
+    Add-Finding -Severity High -Category 'Crypto' -Title ("RDP encryption level {0} (low/client-compatible)" -f $ts.MinEncryptionLevel) `
+      -Remediation 'Set MinEncryptionLevel=3 (High) minimum; pair with NLA + TLS SecurityLayer.'
+  }
+  if ($ts.SecurityLayer -eq 0) {
+    Add-Finding -Severity Medium -Category 'Crypto' -Title 'RDP SecurityLayer=0 (native RDP crypto instead of TLS)'
+  }
+}
+
+# --- Unsigned driver / test-signing exposure ---
+$bcdTest = $null
+try { $bcdTest = (bcdedit /enum `{current`} 2>$null | Select-String 'testsigning\s+Yes') } catch { }
+if ($bcdTest) {
+  Add-Finding -Severity High -Category 'OS' -Title 'Test signing mode enabled (bcdedit testsigning)' `
+    -Detail 'Unsigned kernel drivers load freely - rootkit path.' `
+    -Remediation 'bcdedit /set testsigning off; investigate why it was on.'
+}
+$nointegritychecks = $null
+try { $nointegritychecks = (bcdedit /enum `{current`} 2>$null | Select-String 'nointegritychecks\s+Yes') } catch { }
+if ($nointegritychecks) {
+  Add-Finding -Severity High -Category 'OS' -Title 'Code-integrity checks disabled (nointegritychecks)' `
+    -Remediation 'bcdedit /set nointegritychecks on (restore) - disabled CI allows unsigned code at boot.'
+}
+
+# --- Enabled local-admin RDP/WinRM exposure recap (ties into network findings) ---
+$nullDevice = $null
+try {
+  $denyRdp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections
+  if ($denyRdp -eq 0 -and $build -ge 17763) {
+    Add-Finding -Severity Info -Category 'OS' -Title 'RDP enabled (modern build) - ensure NLA enforced and exposure firewalled'
+  }
+} catch { }
+
 ######################## SUMMARY & REPORTS ########################
 
 Start-Section 'SUMMARY'
@@ -1768,4 +2251,4 @@ Write-Host ("Exit code will be {0} (Critical+High count) for unattended triage."
 exit $exitCode
 
 Write-Host ''
-Write-Host 'BluePEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+Write-Host 'BlueWinPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
