@@ -1,6 +1,29 @@
 
 ######################## SYSTEM & PATCH POSTURE ########################
 
+# Detect elevation once, up front. Several checks below (audit policy, secedit
+# baseline, bcdedit boot config, Security event log, BitLocker, WMI
+# subscriptions, NetworkList history, IIS config) require administrator. This
+# makes that explicit rather than silently reporting a false "OK".
+$script:IsElevated = $false
+try {
+  $script:IsElevated = ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+$script:ElevGated = 'audit policy, secedit password/lockout baseline, bcdedit test-signing/code-integrity, Security event-log size, BitLocker status, WMI permanent-subscription enumeration, NetworkList connectivity history, IIS applicationHost deep config, and other users'' RDP/process history'
+Write-Host ''
+if ($script:IsElevated) {
+  Write-Host '[+] Running ELEVATED - full check coverage.' -ForegroundColor Green
+}
+else {
+  Write-Host '[!] Running NON-ELEVATED - some checks are limited or skipped.' -ForegroundColor Yellow
+  Write-Host ('    Elevation-gated: ' + $script:ElevGated) -ForegroundColor DarkYellow
+  Write-Host '    Re-run from an elevated prompt for a complete audit.' -ForegroundColor DarkYellow
+}
+Add-Finding -Severity $(if ($script:IsElevated) { 'Info' } else { 'Low' }) -Category 'Scan' `
+  -Title $(if ($script:IsElevated) { 'Scan ran elevated (full coverage)' } else { 'Scan ran NON-elevated (partial coverage)' }) `
+  -Detail $(if ($script:IsElevated) { 'Administrator context - all checks attempted.' } else { 'Standard-user context. These checks were limited or skipped: ' + $script:ElevGated + '.' }) `
+  -Remediation $(if ($script:IsElevated) { 'None.' } else { 'Re-run from an elevated PowerShell prompt for complete, trustworthy results.' })
+
 Start-Section 'SYSTEM INFORMATION'
 $os = Get-CimInstance Win32_OperatingSystem
 Add-Finding -Severity Info -Category 'System' -Title 'OS baseline' `
@@ -70,10 +93,21 @@ try {
     $excl += $prefs.ExclusionProcess
     $excl += $prefs.ExclusionExtension
   }
+  # Get-MpPreference returns only the exclusions visible to the caller. A standard
+  # user sees a subset (measured: 3 of 28 on a test host), so the count must never
+  # be presented as complete unless the scan is elevated.
+  $exclPartial = -not $script:IsElevated
   if ($excl.Count -gt 0) {
-    Add-Finding -Severity High -Category 'AV' -Title ('Defender exclusions configured ({0})' -f $excl.Count) `
-      -Detail ('Exclusions: ' + (($excl | Where-Object { $_ }) -join ' | ')) `
+    $suffix = if ($exclPartial) { ' - PARTIAL, needs elevation' } else { '' }
+    $warn = if ($exclPartial) { ' || WARNING: this list is incomplete - a non-elevated caller sees only a subset. Re-run elevated for the true count.' } else { '' }
+    Add-Finding -Severity High -Category 'AV' -Title ('Defender exclusions configured ({0}{1})' -f $excl.Count, $suffix) `
+      -Detail ('Exclusions: ' + (($excl | Where-Object { $_ }) -join ' | ') + $warn) `
       -Remediation 'Review every exclusion for necessity; attackers commonly add their tool paths here. Remove any that are not documented.'
+  }
+  elseif ($exclPartial) {
+    Add-Finding -Severity Info -Category 'AV' -Title 'Defender exclusions not assessed (needs elevation)' `
+      -Detail 'Get-MpPreference returned no exclusions, but a non-elevated caller cannot see the full list. Absence here is not evidence that none are configured.' `
+      -Remediation 'Re-run elevated to enumerate Defender exclusions.'
   }
 }
 catch {
@@ -83,18 +117,29 @@ catch {
 ######################## AUDITING & LOGGING POSTURE (NEW) ########################
 
 Start-Section 'AUDITING & LOGGING POSTURE'
-try {
-  $auditPolicy = (auditpol.exe /get /category:* 2>$null | Where-Object { $_ -match '^\s' })
-  $lapse = $auditPolicy | Where-Object { $_ -match 'Logon/Logoff|Privilege Use|Object Access' -and $_ -match 'No Auditing' }
-  if ($lapse) {
-    Add-Finding -Severity Medium -Category 'Logging' -Title 'Critical audit subcategories set to No Auditing' `
-      -Detail (($lapse | ForEach-Object { $_.Trim() }) -join ' ; ') `
-      -Remediation 'Enable auditing for Logon/Logoff and Privilege Use (advanced audit policy: AuditLogon, AuditPrivilegeUse).'
-  }
-  else {
-    Add-Finding -Severity Info -Category 'Logging' -Title 'Core audit categories enabled'
-  }
-} catch { }
+if (-not $script:IsElevated) {
+  Add-Finding -Severity Info -Category 'Logging' -Title 'Audit policy not assessed (needs elevation)' `
+    -Detail 'auditpol /get requires administrator; run elevated to verify Logon/Logoff, Privilege Use and Object Access auditing.'
+}
+else {
+  try {
+    $auditPolicy = (auditpol.exe /get /category:* 2>$null | Where-Object { $_ -match '^\s' })
+    if (-not $auditPolicy) {
+      Add-Finding -Severity Info -Category 'Logging' -Title 'Audit policy unreadable' -Detail 'auditpol returned no data even when elevated.'
+    }
+    else {
+      $lapse = $auditPolicy | Where-Object { $_ -match 'Logon/Logoff|Privilege Use|Object Access' -and $_ -match 'No Auditing' }
+      if ($lapse) {
+        Add-Finding -Severity Medium -Category 'Logging' -Title 'Critical audit subcategories set to No Auditing' `
+          -Detail (($lapse | ForEach-Object { $_.Trim() }) -join ' ; ') `
+          -Remediation 'Enable auditing for Logon/Logoff and Privilege Use (advanced audit policy: AuditLogon, AuditPrivilegeUse).'
+      }
+      else {
+        Add-Finding -Severity Info -Category 'Logging' -Title 'Core audit categories enabled'
+      }
+    }
+  } catch { }
+}
 
 # Security log size + retention
 try {
@@ -107,7 +152,13 @@ try {
   else {
     Add-Finding -Severity Info -Category 'Logging' -Title "Security event log size ${mb} MB"
   }
-} catch { }
+}
+catch {
+  if (-not $script:IsElevated) {
+    Add-Finding -Severity Info -Category 'Logging' -Title 'Security event log not assessed (needs elevation)' `
+      -Detail 'Reading the Security log configuration requires administrator; run elevated to check its size/retention.'
+  }
+}
 
 # WEF
 if (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager') {
