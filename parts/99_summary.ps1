@@ -20,7 +20,7 @@ else {
   Write-Host '  No Critical/High findings. ' -ForegroundColor Green
 }
 
-Write-Reports -Dir $OutputDir
+Write-Reports -Dir $OutputDir -LaunchHtml
 
 # Unattended mode: exit code = count of Critical+High findings (capped 250) so
 # deployment/scheduling tooling can triage hosts without parsing output.
@@ -31,4 +31,4 @@ Write-Host ("Exit code will be {0} (Critical+High count) for unattended triage."
 exit $exitCode
 
 Write-Host ''
-Write-Host 'BluePEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
+Write-Host 'BlueWinPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan

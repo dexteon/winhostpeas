@@ -25,7 +25,8 @@ param(
   [switch]$TimeStamp,
   [switch]$FullCheck,
   [string]$OutputDir = '.\BlueWinPEAS_Output',
-  [switch]$NoReport
+  [switch]$NoReport,
+  [switch]$NoLaunch
 )
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -78,8 +79,8 @@ function Add-Finding {
 
   $sevColor = @{ Critical = 'Red'; High = 'Red'; Medium = 'Yellow'; Low = 'Cyan'; Info = 'Gray' }
   Write-Host ('  [{0}] {1}: {2}' -f $Severity, $Category, $Title) -ForegroundColor $sevColor[$Severity]
-  if ($Detail)     { Write-Host ('      ' + $Detail) -ForegroundColor DarkGray }
-  if ($Remediation) { Write-Host ('      Fix: ' + $Remediation) -ForegroundColor DarkCyan }
+  if ($Detail)       { Write-Host ('      ' + $Detail) -ForegroundColor DarkGray }
+  if ($Remediation)  { Write-Host ('      Fix: ' + $Remediation) -ForegroundColor DarkCyan }
 }
 
 function Start-Section {
@@ -99,7 +100,7 @@ function Get-HighestSeverity {
 }
 
 function Write-Reports {
-  param([string]$Dir)
+  param([string]$Dir, [switch]$LaunchHtml)
   if ($NoReport) { return }
   try { New-Item -ItemType Directory -Path $Dir -Force | Out-Null } catch { Write-Host "Cannot create report dir: $_" -ForegroundColor Red; return }
   $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -119,43 +120,127 @@ function Write-Reports {
   @{ Meta = $meta; Findings = $script:Findings } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
   $script:Findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 
-  $sevBadge = { param($s)
-    $c = @{ Critical='#b91c1c'; High='#dc2626'; Medium='#d97706'; Low='#0891b2'; Info='#6b7280' }[$s]
-    '<span style="background:' + $c + ';color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">' + $s + '</span>'
-  }
-  $rows = foreach ($f in $script:Findings) {
-    '<tr><td>' + $f.Severity + '</td><td>' + $f.Category + '</td><td><b>' + $f.Title + '</b></td><td>' + $f.Detail +
-    '</td><td><code>' + $f.Evidence + '</code></td><td>' + $f.Remediation + '</td></tr>'
-  }
-  $counts = $script:Findings | Group-Object Severity | ForEach-Object { $_.Name + ': ' + $_.Count }
-  $htmlDoc = @"
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
-<style>
- body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f8fafc;color:#111827}
- h1{margin-bottom:0} .meta{color:#6b7280;margin-bottom:16px}
- table{border-collapse:collapse;width:100%;background:#fff;font-size:13px}
- th,td{border:1px solid #e5e7eb;padding:6px 8px;text-align:left;vertical-align:top}
- th{background:#f1f5f9}
- tr:nth-child(even){background:#f9fafb}
- .Critical{background:#b91c1c!important;color:#fff}.High{background:#fee2e2}
- .Medium{background:#fef3c7}.Low{background:#e0f2fe}.Info{background:#f3f4f6}
- code{font-size:11px;word-break:break-all}
-</style></head><body>
-<h1>BlueWinPEAS Posture Audit</h1>
-<div class="meta">Host: $($env:COMPUTERNAME) &middot; $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; `$joinCountsPlaceholder`</div>
-<table><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Detail</th><th>Evidence</th><th>Remediation</th></tr>
-`$rowsPlaceholder`
-</table></body></html>
+  # ---------- HTML dashboard ----------
+  $sevOrder = 'Critical','High','Medium','Low','Info'
+  $counts = @{}
+  foreach ($s in $sevOrder) { $counts[$s] = @($script:Findings | Where-Object { $_.Severity -eq $s }).Count }
+  $cats = $script:Findings | Group-Object Category | Sort-Object Name
+
+  $tiles = foreach ($s in $sevOrder) {
+    $c = @{ Critical='#b91c1c'; High='#dc2626'; Medium='#d97706'; Low='#0891b2'; Info='#64748b' }[$s]
+    @"
+
+    <div class="tile" style="border-top:4px solid $c" data-sev="$s" onclick="filterSev('$s')">
+      <div class="tile-num" style="color:$c">$($counts[$s])</div>
+      <div class="tile-label">$s</div>
+    </div>
 "@
-  $htmlDoc = $htmlDoc.Replace('$joinCountsPlaceholder', ($counts -join ' &middot; '))
-  $htmlDoc = $htmlDoc.Replace('$rowsPlaceholder', ($rows -join "`n"))
+  }
+  $catOpts = foreach ($c in $cats) { '<option value="' + $c.Name + '">' + $c.Name + ' (' + $c.Count + ')</option>' }
+
+  $rowsJs = foreach ($f in $script:Findings) {
+    $esc = { param($t) if ($null -eq $t) { '' } else { $t.ToString().Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", ' ') } }
+    '  { sev: "' + $f.Severity + '", cat: "' + (& $esc $f.Category) + '", title: "' + (& $esc $f.Title) + '", detail: "' + (& $esc $f.Detail) + '", evid: "' + (& $esc $f.Evidence) + '", rem: "' + (& $esc $f.Remediation) + '" },'
+  }
+
+  $htmlDoc = @"
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>BlueWinPEAS Report - $($env:COMPUTERNAME)</title>
+<style>
+ body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f1f5f9;color:#111827}
+ header{background:#0f172a;color:#fff;padding:18px 28px}
+ header h1{margin:0;font-size:22px} header .meta{color:#94a3b8;font-size:13px;margin-top:4px}
+ .bar{display:flex;gap:14px;align-items:center;background:#fff;padding:14px 28px;border-bottom:1px solid #e2e8f0;flex-wrap:wrap}
+ .tiles{display:flex;gap:12px;margin:0}
+ .tile{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:10px 18px;min-width:86px;text-align:center;cursor:pointer;user-select:none}
+ .tile:hover{box-shadow:0 1px 4px rgba(0,0,0,.12)}
+ .tile.active{outline:2px solid #0f172a}
+ .tile-num{font-size:26px;font-weight:700;line-height:1.1}
+ .tile-label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#64748b}
+ .controls{display:flex;gap:8px;align-items:center;margin-left:auto;flex-wrap:wrap}
+ input[type=text],select{padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;background:#fff}
+ input[type=text]{width:240px}
+ button{padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;font-size:13px}
+ button:hover{background:#f8fafc}
+ main{padding:20px 28px}
+ table{border-collapse:collapse;width:100%;background:#fff;font-size:13px}
+ th,td{border:1px solid #e5e7eb;padding:7px 9px;text-align:left;vertical-align:top}
+ th{background:#f1f5f9;position:sticky;top:0}
+ tr:nth-child(even){background:#f9fafb}
+ code{font-size:11px;word-break:break-all}
+ .sev{display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;color:#fff}
+ .sev.Critical{background:#b91c1c}.sev.High{background:#dc2626}.sev.Medium{background:#d97706}
+ .sev.Low{background:#0891b2}.sev.Info{background:#64748b}
+ .rem{color:#0f766e}
+ .count{color:#64748b;font-size:12px;margin:0 0 10px 2px}
+</style></head><body>
+<header>
+ <h1>BlueWinPEAS Posture Audit &mdash; $($env:COMPUTERNAME)</h1>
+ <div class="meta">Generated $(Get-Date) &middot; $($stopwatch.Elapsed.ToString('mm\:ss')) elapsed &middot; $($meta.TotalFindings) findings &middot; highest severity: $($meta.HighestSeverity) &middot; FullCheck: $($meta.FullCheck)</div>
+</header>
+<div class="bar">
+ <div class="tiles">`$tilesPlaceholder</div>
+ <div class="controls">
+   <input type="text" id="q" placeholder="Search findings..." oninput="render()">
+   <select id="catSel" onchange="render()"><option value="">All categories</option>`$catOptsPlaceholder</select>
+   <button onclick="clearFilters()">Clear filters</button>
+ </div>
+</div>
+<main>
+ <p class="count" id="count"></p>
+ <table id="tbl"><thead><tr><th style="width:70px">Severity</th><th style="width:130px">Category</th><th>Finding</th><th>Detail / Evidence</th><th style="width:28%">Remediation</th></tr></thead><tbody id="tbody"></tbody></table>
+</main>
+<script>
+const F = [
+`$rowsJsPlaceholder
+];
+let sevFilter = '';
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+function filterSev(s){ sevFilter = (sevFilter===s)?'':s;
+  document.querySelectorAll('.tile').forEach(t=>t.classList.toggle('active', t.dataset.sev===sevFilter)); render(); }
+function clearFilters(){ sevFilter=''; document.getElementById('q').value=''; document.getElementById('catSel').value='';
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active')); render(); }
+function render(){
+  const q = document.getElementById('q').value.toLowerCase();
+  const cat = document.getElementById('catSel').value;
+  const rows = F.filter(f =>
+    (!sevFilter || f.sev===sevFilter) &&
+    (!cat || f.cat===cat) &&
+    (!q || (f.title+' '+f.detail+' '+f.evid+' '+f.rem+' '+f.cat).toLowerCase().includes(q)));
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = rows.map(f =>
+    '<tr><td><span class="sev '+f.sev+'">'+f.sev+'</span></td><td>'+esc(f.cat)+'</td>'+
+    '<td><b>'+esc(f.title)+'</b>'+(f.evid?'<br><code>'+esc(f.evid)+'</code>':'')+'</td>'+
+    '<td>'+esc(f.detail)+'</td>'+
+    '<td class="rem">'+esc(f.rem)+'</td></tr>').join('');
+  document.getElementById('count').textContent = rows.length + ' of ' + F.length + ' findings shown';
+}
+render();
+</script>
+</body></html>
+"@
+  $htmlDoc = $htmlDoc.Replace('$tilesPlaceholder', ($tiles -join ''))
+  $htmlDoc = $htmlDoc.Replace('$catOptsPlaceholder', ($catOpts -join ''))
+  $htmlDoc = $htmlDoc.Replace('$rowsJsPlaceholder', ($rowsJs -join "`n"))
   Set-Content -Path $html -Value $htmlDoc -Encoding UTF8
 
   Write-Host ''
-  Write-Host ('Report summary: ' + ($counts -join ', ')) -ForegroundColor Cyan
+  Write-Host ('Report summary: ' + (($sevOrder | Where-Object { $counts[$_] -gt 0 } | ForEach-Object { $_ + ': ' + $counts[$_] }) -join ', ')) -ForegroundColor Cyan
   Write-Host ('Reports written: ' + $json) -ForegroundColor Cyan
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
+
+  # Auto-launch the HTML report in the default browser (interactive runs).
+  if ($LaunchHtml -and -not $NoLaunch) {
+    try {
+      $resolved = (Resolve-Path $html).Path
+      Start-Process $resolved
+      Write-Host ('Report opened in browser: ' + $resolved) -ForegroundColor Cyan
+    }
+    catch {
+      Write-Host ('Could not launch browser automatically - open manually: ' + $html) -ForegroundColor Yellow
+    }
+  }
 }
 
 ######################## RETAINED HELPERS (defensive refit) ########################
@@ -2625,7 +2710,7 @@ else {
   Write-Host '  No Critical/High findings. ' -ForegroundColor Green
 }
 
-Write-Reports -Dir $OutputDir
+Write-Reports -Dir $OutputDir -LaunchHtml
 
 # Unattended mode: exit code = count of Critical+High findings (capped 250) so
 # deployment/scheduling tooling can triage hosts without parsing output.
