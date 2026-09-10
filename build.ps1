@@ -10,7 +10,7 @@ $order = @(
   '10_header', '11_findings', '12_helpers', '03_adfuncs', '13_secrets',
   '20_system', '21_creds', '22_privesc', '23_network', '24_ad_software',
   '25_ot_discovery', '26_service_inventory', '27_loopback', '28_iis', '29_os_vulns',
-  '30_hardening', '31_exec_summary', '32_history', '33_advanced', '99_summary'
+  '30_hardening', '31_exec_summary', '32_history', '33_advanced', '34_btfm_expansion', '99_summary'
 )
 
 $sb = New-Object System.Text.StringBuilder
