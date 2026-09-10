@@ -150,11 +150,36 @@ try {
 } catch { }
 
 try {
+  # PasswordRequired = False is the PASSWD_NOTREQD flag. It means a blank password
+  # is PERMITTED on the account, NOT that the account has one - the flag is a
+  # routine artifact of programmatic account creation, so reporting it as
+  # "no password" raises a false alarm on ordinary service accounts.
+  #
+  # Confirming whether a blank password actually authenticates would require an
+  # authentication attempt, which writes failed-logon events and can trip lockout
+  # policy. This tool stays passive, so it reports the flag accurately and scales
+  # severity by whether blank-password network logon is possible at all.
+  $limitBlank = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LimitBlankPasswordUse -ErrorAction SilentlyContinue).LimitBlankPasswordUse
+  # Absent defaults to 1 (blocked) on all supported Windows versions.
+  $blankOverNetworkAllowed = ($limitBlank -eq 0)
+
   $users = Get-LocalUser -ErrorAction Stop
   foreach ($u in $users) {
     if ($u.Enabled -and -not $u.PasswordRequired) {
-      Add-Finding -Severity Critical -Category 'Accounts' -Title ("Account '{0}' has NO password requirement" -f $u.Name) `
-        -Remediation 'Disable the account or require a password immediately.'
+      $hasPwdEvidence = $null -ne $u.PasswordLastSet
+      $sev = if ($blankOverNetworkAllowed) { 'High' } elseif ($hasPwdEvidence) { 'Low' } else { 'Medium' }
+      $detail = "The PASSWD_NOTREQD flag is set, so this account is allowed to have a blank password. That is not proof it has one, and this scan does not attempt authentication to find out."
+      $detail += if ($hasPwdEvidence) { (" A password was last set {0:yyyy-MM-dd}, which indicates one exists." -f $u.PasswordLastSet) } else { ' No password-set timestamp is recorded, so a blank password is plausible.' }
+      $detail += if ($blankOverNetworkAllowed) {
+        ' LimitBlankPasswordUse = 0, so a blank password WOULD be usable for network logon. This is the combination that matters.'
+      }
+      else {
+        ' LimitBlankPasswordUse = 1, so even a blank password could not be used for network logon, only at the console.'
+      }
+      Add-Finding -Severity $sev -Category 'Accounts' -Title ("Account '{0}' permits a blank password (PASSWD_NOTREQD)" -f $u.Name) `
+        -Detail $detail `
+        -Evidence ("{0} | PasswordLastSet: {1}" -f $u.Name, $(if ($hasPwdEvidence) { '{0:yyyy-MM-dd HH:mm}' -f $u.PasswordLastSet } else { 'never' })) `
+        -Remediation 'Clear the flag with: net user <user> /passwordreq:yes. Confirm the account holds a strong password, and keep LimitBlankPasswordUse = 1 so a blank password can never be used over the network.'
     }
     if (-not $u.Enabled) {
       Add-Finding -Severity Info -Category 'Accounts' -Title ("Disabled account: {0}" -f $u.Name)
