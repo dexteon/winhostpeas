@@ -104,7 +104,9 @@ Loopback-bound listeners with owning process, loopback conversations, `netsh por
 
 ### Account hygiene and identity
 
-Passwordless local accounts, password policy, never-expiring passwords, local admin inventory, LAPS presence, BitLocker, screen-lock timeout. Domain-joined hosts also get NTLM policy and ADCS ESC10 Schannel UPN mapping, both read from the local registry.
+Accounts carrying the `PASSWD_NOTREQD` flag, password policy, never-expiring passwords, local admin inventory, LAPS presence, BitLocker, screen-lock timeout. Domain-joined hosts also get NTLM policy and ADCS ESC10 Schannel UPN mapping, both read from the local registry.
+
+The blank-password check is worth explaining, because the obvious version of it is wrong. `PASSWD_NOTREQD` means a blank password is *permitted*, not that the account has one, and the flag is a routine artifact of programmatic account creation. Reporting it as "no password" raises a false alarm on ordinary service accounts. Confirming the real state would mean attempting authentication, which writes failed-logon events and can trip lockout policy, so the tool does not do it. Instead it reports the flag accurately and scales severity by `LimitBlankPasswordUse`, since a blank password that cannot be used over the network is a very different problem from one that can.
 
 Domain-side hygiene such as Kerberoastable SPNs and gMSA read permissions is deliberately not assessed, because every way to check it means querying a domain controller.
 
