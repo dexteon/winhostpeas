@@ -130,6 +130,24 @@ UAC-bypass registry residue (fodhelper, eventvwr, sdclt), file-association and P
 
 Scheduled tasks are scanned for obfuscated commands, including tasks under `\Microsoft\`. Masquerading hides there, so excluding that tree would blind the check at its most useful target.
 
+### Extended persistence and hardening baseline
+
+The autostart slots that sit beside the ones everyone checks, drawn from the Blue Team Field Manual.
+
+`RunOnceEx`, `RunServices` and `RunServicesOnce` under both hives, the policy `Explorer\Run` keys, `ShellServiceObjectDelayLoad`, and the legacy `Load`/`Run`/`Scripts` values under the HKCU Windows NT key. Group Policy logon and startup script registrations. Legacy startup files (`winstart.bat`, `wininit.ini`, `autoexec.bat`, `autoexec.nt`) and `win.ini` `run=`/`load=` directives.
+
+`HKCU\Environment` gets two checks: `UserInitMprLogonScript`, which runs at every logon of that user and appears in no machine-wide autoruns audit (T1037.001), and user-writable directories on the user `PATH`, which can shadow a system binary invoked without a full path.
+
+Session Manager `BootExecute` against its expected default, and `KnownDLLs` validated by signature rather than by name. The expected KnownDLLs set varies by Windows version and architecture, so this checks that each entry resolves to a Microsoft-signed DLL in System32 instead of comparing against a name list that would drift.
+
+Browser Helper Objects, deduplicated across the native and Wow6432Node registrations, resolved to their backing DLL and flagged when that DLL sits outside Windows or Program Files.
+
+Accessibility binaries (`sethc.exe`, `utilman.exe`, `osk.exe`, and others) are signature-checked. These are launchable from the logon screen before authentication, so a replaced one is a pre-authentication SYSTEM backdoor.
+
+Firewall logging state per profile, Application and System event log sizing, IPv6 `DisabledComponents` recorded for baseline comparison, and a comparison of the scheduled-task registry cache against the enumerable task list, since a task present in `TaskCache` but absent from the scheduler API has been deliberately hidden.
+
+Suspect commands and DLLs surfaced by these checks carry a SHA-256 in the finding's Evidence field for downstream IOC matching.
+
 ### Image hardening baseline
 
 Every check reports current state plus the exact image change: Defender ASR rules (against Microsoft's canonical rule list), Controlled Folder Access, network and cloud-delivered protection, Exploit Protection, AppLocker/WDAC, SmartScreen, UAC consent level, Guest account, features to strip, admin-count trim, and null-session and remote-registry hardening.
