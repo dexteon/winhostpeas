@@ -157,10 +157,8 @@ try {
     Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
       $stub = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).StubPath
       if ($stub) {
-        $known = ($_.PSChildName -match '^\{?[0-9A-Fa-f-]{36}\}?$') -and ($stub -match 'system32|Program Files')
-        $sev = if ($stub -match 'user-writable|AppData|Temp|Public|Downloads') { 'High' } else { 'Low' }
         if ($stub -match 'AppData|\\Temp\\|\\Public\\|Downloads') {
-          Add-Finding -Severity $sev -Category 'Persistence' -Title ("Active Setup StubPath in user-writable path: {0}" -f $_.PSChildName) `
+          Add-Finding -Severity High -Category 'Persistence' -Title ("Active Setup StubPath in user-writable path: {0}" -f $_.PSChildName) `
             -Detail ("Command: {0}" -f $stub) `
             -Remediation 'StubPath runs at first logon of every user; user-writable stub = persistence + privilege escalation.'
         }
