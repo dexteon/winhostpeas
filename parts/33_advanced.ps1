@@ -201,7 +201,16 @@ try {
       -Evidence $p.ExecutablePath `
       -Remediation 'Isolate the host and investigate. Genuine svchost/lsass/csrss always run from System32.'
   }
+  # The audit's own process and the chain that launched it (for example a scheduler or an
+  # agent running "pwsh -ExecutionPolicy Bypass -File WinHostPEAS.ps1") are not findings.
+  $selfChain = @{}
+  $walk = $PID
+  for ($i = 0; $i -lt 8 -and $walk -and -not $selfChain.ContainsKey($walk); $i++) {
+    $selfChain[$walk] = $true
+    $walk = ($procs | Where-Object { $_.ProcessId -eq $walk } | Select-Object -First 1).ParentProcessId
+  }
   foreach ($c in @($procs | Where-Object {
+        -not $selfChain.ContainsKey($_.ProcessId) -and
         $_.Name -match '^(cmd|powershell|pwsh|wscript|cscript|mshta|regsvr32|rundll32)\.exe$' -and
         $_.CommandLine -match $script:ObfPattern
       } | Select-Object -First 5)) {

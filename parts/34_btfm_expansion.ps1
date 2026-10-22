@@ -72,16 +72,87 @@ if ($envProps) {
       -Evidence ('{0} :: UserInitMprLogonScript{1}' -f $envKey, $(if ($hash) { " :: SHA256 $hash" } else { '' })) `
       -Remediation 'Delete the value and investigate the referenced command. MITRE T1037.001.'
   }
-  # A user-writable directory placed early in the user PATH lets an attacker
-  # shadow a system binary invoked without a full path.
+}
+
+# --- PATH hijack: machine and user PATH directories judged by ACL --------------
+# A directory on the machine PATH that a low-privilege principal can write to
+# hijacks any binary launched by bare name, including by SYSTEM services and
+# scheduled tasks, and feeds the DLL search order (T1574.007). Writability is
+# decided by the ACL (SID-based), not by the folder name: C:\ProgramData\x\bin
+# with an admin-only ACL is fine, C:\Tools with Users:Modify is not.
+function Test-PathEntryWritable {
+  param([string]$Entry)
+  $dir = [System.Environment]::ExpandEnvironmentVariables($Entry.Trim().Trim('"'))
+  if (-not $dir) { return $null }
+  if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return [pscustomobject]@{ Dir = $dir; Missing = $true; Hit = $null } }
+  $acl = $null
+  try { $acl = Get-Acl -LiteralPath $dir -ErrorAction Stop } catch { return [pscustomobject]@{ Dir = $dir; Missing = $false; Hit = $null; Unreadable = $true } }
+  $hit = $null
+  if (Get-Command Get-LowPrivFolderWriteAce -ErrorAction SilentlyContinue) { $hit = Get-LowPrivFolderWriteAce -ACLObject $acl }
+  else { $hit = Get-LowPrivWriteAce -ACLObject $acl }
+  # A user's own profile folders are writable by that user by design.
+  if ($hit -and $dir -like "$env:USERPROFILE*" -and $hit.Sid -eq $script:AclCurrent.User.Value) { $hit = $null }
+  return [pscustomobject]@{ Dir = $dir; Missing = $false; Hit = $hit; Unreadable = $false }
+}
+
+try {
+  $machEnvKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+  $machPath = (Get-ItemProperty $machEnvKey -Name Path -ErrorAction Stop).Path
+  $entries = @($machPath -split ';' | Where-Object { $_ -and $_.Trim() })
+  $sys32 = (Join-Path $env:SystemRoot 'System32').TrimEnd('\').ToLower()
+  $sys32Index = -1
+  for ($i = 0; $i -lt $entries.Count; $i++) {
+    $e = [System.Environment]::ExpandEnvironmentVariables($entries[$i].Trim().Trim('"')).TrimEnd('\').ToLower()
+    if ($e -eq $sys32) { $sys32Index = $i; break }
+  }
+  $writable = @(); $missing = @(); $unreadable = 0
+  for ($i = 0; $i -lt $entries.Count; $i++) {
+    $r = Test-PathEntryWritable -Entry $entries[$i]
+    if (-not $r) { continue }
+    if ($r.Missing) { $missing += $r.Dir; continue }
+    if ($r.Unreadable) { $unreadable++; continue }
+    if ($r.Hit) {
+      $ahead = ($sys32Index -lt 0 -or $i -lt $sys32Index)
+      $writable += $r.Dir
+      Add-Finding -Severity $(if ($ahead) { 'High' } else { 'Medium' }) -Category 'Persistence' -Title ('Machine PATH directory writable by low-privilege principal: {0}' -f $r.Dir) `
+        -Detail ('Position {0} of {1}{2} | {3} ({4}) has {5} ({6}). Any program or service that launches a binary by bare name, or loads a DLL through the search order, can be hijacked from this folder.' -f ($i + 1), $entries.Count, $(if ($ahead) { ' (ahead of System32)' } else { ' (after System32)' }), $r.Hit.Name, $r.Hit.Sid, $r.Hit.Level, $r.Hit.Rights) `
+        -Evidence ('{0} :: Path [{1}]' -f $machEnvKey, $entries[$i]) `
+        -Remediation 'Remove the directory from the machine PATH or restrict its ACL to Administrators and SYSTEM. MITRE T1574.007.'
+    }
+  }
+  Add-Finding -Severity $(if ($missing.Count -gt 0) { 'Low' } else { 'Info' }) -Category 'Persistence' -Title ('Machine PATH: {0} entries checked by ACL, {1} writable, {2} missing' -f $entries.Count, $writable.Count, $missing.Count) `
+    -Detail $(if ($missing.Count -gt 0) { 'Missing directories (a low-privilege user who can create them inherits the PATH slot): ' + (($missing | Select-Object -First 10) -join ' | ') + $(if ($unreadable -gt 0) { " | $unreadable ACL(s) unreadable" } else { '' }) } else { 'All machine PATH directories exist and none grants write access to a low-privilege principal.' + $(if ($unreadable -gt 0) { " $unreadable ACL(s) unreadable." } else { '' }) }) `
+    -Evidence "$machEnvKey :: Path" `
+    -Remediation $(if ($missing.Count -gt 0) { 'Remove stale PATH entries; check whether the parent directory lets a standard user create the missing folder.' } else { '' })
+} catch {
+  Add-Finding -Severity Info -Category 'Persistence' -Title 'Machine PATH directories not assessed' `
+    -Detail ('Reading the machine PATH failed: ' + $_.Exception.Message)
+}
+
+# User PATH (HKCU\Environment): same ACL rule. A directory writable by a
+# different low-privilege principal lets that principal hijack this user's
+# sessions, which is a privilege escalation when this user is an administrator.
+if ($envProps) {
   $userPath = $envProps.Path
   if ($userPath) {
-    $risky = @($userPath -split ';' | Where-Object { $_ -and ($_ -match '(?i)(AppData|\\Temp\\|\\Public\\|Downloads|ProgramData)') })
-    if ($risky.Count -gt 0) {
-      Add-Finding -Severity Medium -Category 'Persistence' -Title ('User PATH contains {0} user-writable director(ies)' -f $risky.Count) `
-        -Detail ('Entries: ' + ($risky -join ' | ') + ' || A writable directory on PATH can shadow a system binary called without a full path.') `
-        -Evidence "$envKey :: Path" `
-        -Remediation 'Remove user-writable directories from PATH, or confirm each is intentional and access-controlled.'
+    try {
+      $uEntries = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() })
+      $uHits = @()
+      foreach ($ue in $uEntries) {
+        $r = Test-PathEntryWritable -Entry $ue
+        if ($r -and $r.Hit) { $uHits += ('{0} [{1} ({2}): {3}]' -f $r.Dir, $r.Hit.Name, $r.Hit.Sid, $r.Hit.Level) }
+      }
+      if ($uHits.Count -gt 0) {
+        Add-Finding -Severity Medium -Category 'Persistence' -Title ('User PATH contains {0} director(ies) writable by another low-privilege principal' -f $uHits.Count) `
+          -Detail ('Entries: ' + ($uHits -join ' | ') + ' || A writable directory on PATH can shadow a system binary called without a full path. Directories writable only by this user are not reported.') `
+          -Evidence "$envKey :: Path" `
+          -Remediation 'Remove the directories from the user PATH or restrict their ACLs. MITRE T1574.007.'
+      }
+      else {
+        Add-Finding -Severity Info -Category 'Persistence' -Title ('User PATH: {0} entries checked by ACL, none writable by another low-privilege principal' -f $uEntries.Count)
+      }
+    } catch {
+      Add-Finding -Severity Info -Category 'Persistence' -Title 'User PATH directories not assessed' -Detail ('Check failed: ' + $_.Exception.Message)
     }
   }
 }
@@ -132,6 +203,20 @@ if ($sm) {
   else {
     Add-Finding -Severity Info -Category 'Persistence' -Title 'BootExecute at expected default'
   }
+  # SafeDllSearchMode = 0 puts the current directory ahead of System32 in the DLL
+  # search order for every process (T1574.001). Absent means 1 (safe).
+  try {
+    $sdsm = if ($sm.PSObject.Properties.Name -contains 'SafeDllSearchMode') { [int]$sm.SafeDllSearchMode } else { $null }
+    if ($sdsm -eq 0) {
+      Add-Finding -Severity High -Category 'Hardening' -Title 'SafeDllSearchMode disabled (SafeDllSearchMode = 0)' `
+        -Detail 'The current working directory is searched before System32 for every DLL load, so a planted DLL beside any document or in any writable launch directory is loaded by the process that opens it.' `
+        -Evidence "$smKey :: SafeDllSearchMode" `
+        -Remediation 'Delete the value or set it to 1. MITRE T1574.001.'
+    }
+    else {
+      Add-Finding -Severity Info -Category 'Hardening' -Title ('SafeDllSearchMode {0}' -f $(if ($null -eq $sdsm) { 'at default (not set = enabled)' } else { "= $sdsm (enabled)" }))
+    }
+  } catch { }
 }
 
 # KnownDLLs is the trusted preload set; an added entry is loaded by every process
@@ -243,6 +328,96 @@ if (Test-Path $winIni) {
       -Evidence $winIni `
       -Remediation 'Blank the value. These directives still execute at logon and are almost never used legitimately.'
   }
+}
+
+# --- PowerShell profile scripts ---------------------------------------------------
+# A profile runs in every PowerShell session of its scope (T1546.013). AllUsers
+# profiles run for every administrator who opens a shell; autoruns-style tooling
+# often misses them.
+try {
+  $obfRx = if ($script:ObfPattern) { $script:ObfPattern } else { '(?i)IEX\s*\(|Invoke-Expression|FromBase64String|DownloadString|DownloadFile|Net\.WebClient|Reflection\.Assembly\]::Load' }
+  $isServerSku = $false
+  try { $isServerSku = ([int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -ne 1) } catch { }
+  $psDocs = Join-Path ([Environment]::GetFolderPath('MyDocuments')) ''
+  $profileSet = @(
+    @{ Scope = 'AllUsers'; Path = "$env:windir\System32\WindowsPowerShell\v1.0\profile.ps1" }
+    @{ Scope = 'AllUsers'; Path = "$env:windir\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1" }
+    @{ Scope = 'AllUsers'; Path = "$env:ProgramFiles\PowerShell\7\profile.ps1" }
+    @{ Scope = 'AllUsers'; Path = "$env:ProgramFiles\PowerShell\7\Microsoft.PowerShell_profile.ps1" }
+    @{ Scope = 'CurrentUser'; Path = (Join-Path $psDocs 'WindowsPowerShell\profile.ps1') }
+    @{ Scope = 'CurrentUser'; Path = (Join-Path $psDocs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1') }
+    @{ Scope = 'CurrentUser'; Path = (Join-Path $psDocs 'PowerShell\profile.ps1') }
+    @{ Scope = 'CurrentUser'; Path = (Join-Path $psDocs 'PowerShell\Microsoft.PowerShell_profile.ps1') }
+  )
+  $profFound = 0
+  foreach ($pf in $profileSet) {
+    if (-not (Test-Path -LiteralPath $pf.Path -PathType Leaf)) { continue }
+    $profFound++
+    $content = ''
+    try { $content = [string](Get-Content -LiteralPath $pf.Path -Raw -ErrorAction Stop) } catch { }
+    $obf = ($content -and ($content -match $obfRx))
+    # Download or encoded payloads are the attack shape. Invoke-Expression alone is common in
+    # legitimate tool hooks: conda init writes "(& conda.exe shell.powershell hook) | Out-String
+    # | ?{$_} | Invoke-Expression" into every Anaconda user's profile.
+    $dlEnc = ($content -and ($content -match '(?i)DownloadString|DownloadFile|DownloadData|Net\.WebClient|Invoke-WebRequest|\biwr\b|Invoke-RestMethod|\birm\b|Start-BitsTransfer|FromBase64String|-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{20,}|Reflection\.Assembly\]::Load'))
+    # Strip recognized conda hook lines, then judge whatever is left.
+    $condaRx = '(?im)^.*conda(\.exe)?["'']?\s+["'']?shell\.powershell["'']?\s+["'']?hook.*Invoke-Expression.*$'
+    $knownHook = ($content -and ($content -match $condaRx))
+    if ($knownHook) { $obf = (($content -replace $condaRx, '') -match $obfRx) }
+    $len = (Get-Item -LiteralPath $pf.Path).Length
+    $sev = if ($dlEnc) { 'High' } elseif ($obf) { 'Medium' } elseif ($pf.Scope -eq 'AllUsers' -and $isServerSku) { 'High' } elseif ($pf.Scope -eq 'AllUsers') { 'Medium' } else { 'Low' }
+    Add-Finding -Severity $sev -Category 'Persistence' -Title ('PowerShell {0} profile script present: {1}' -f $pf.Scope, (Split-Path $pf.Path -Leaf)) `
+      -Detail ('Path: {0} | Size: {1} bytes{2}. Runs at the start of every {3} PowerShell session.' -f $pf.Path, $len, $(if ($dlEnc) { ' | content downloads or decodes a payload' } elseif ($obf) { ' | content uses Invoke-Expression outside a recognized tool hook' } elseif ($knownHook) { ' | recognized conda init hook only' } else { '' }),$(if ($pf.Scope -eq 'AllUsers') { 'user''s' } else { 'session of this user''s' })) `
+      -Evidence ('{0} :: SHA256 {1}' -f $pf.Path, (Get-SuspectHash $pf.Path)) `
+      -Remediation $(if ($obf) { 'Read the profile now. Download, base64 or Invoke-Expression constructs in a profile are the classic T1546.013 persistence.' } else { 'Confirm the profile content is expected; AllUsers profiles should be rare and change-controlled. MITRE T1546.013.' })
+  }
+  if ($profFound -eq 0) {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'No PowerShell profile scripts present (AllUsers or CurrentUser)'
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'Persistence' -Title 'PowerShell profile scripts not assessed' -Detail ('Check failed: ' + $_.Exception.Message)
+}
+
+# --- Loaded kernel drivers: signature and known-vulnerable names -------------------
+# A running driver that is unsigned, test-signed or on the LOLDrivers list is the
+# bring-your-own-vulnerable-driver pattern used to kill EDR (T1068, T1014).
+try {
+  $lolDrivers = @('RTCore64.sys', 'DBUtil_2_3.sys', 'gdrv.sys', 'AsIO.sys', 'ene.sys', 'iqvw64e.sys', 'mhyprot2.sys', 'PROCEXP152.sys',
+                  'aswArPot.sys', 'WinRing0x64.sys', 'WinRing0.sys', 'kprocesshacker.sys', 'HW.sys', 'atillk64.sys', 'AsrDrv106.sys', 'AsrDrv103.sys',
+                  'dbk64.sys', 'dbk32.sys', 'zam64.sys', 'TrueSight.sys', 'viragt64.sys', 'AsUpIO.sys', 'NalDrv.sys', 'EneIo64.sys', 'EneTechIo64.sys')
+  $drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName })
+  $drvChecked = 0; $drvFlagged = 0; $drvMissing = 0
+  foreach ($drv in $drivers) {
+    $dp = "$($drv.PathName)".Trim().Trim('"')
+    $dp = $dp -replace '^\\\?\?\\', ''
+    $dp = $dp -replace '^(?i)\\SystemRoot', $env:SystemRoot
+    $dp = [System.Environment]::ExpandEnvironmentVariables($dp)
+    if ($dp -match '^(?i)system32\\') { $dp = Join-Path $env:SystemRoot $dp }
+    if (-not (Test-Path -LiteralPath $dp -PathType Leaf)) { $drvMissing++; continue }
+    $drvChecked++
+    $leaf = Split-Path $dp -Leaf
+    $known = ($lolDrivers | Where-Object { $_ -ieq $leaf } | Select-Object -First 1)
+    $sigStatus = 'unknown'; $signer = ''
+    try {
+      $sig = Get-AuthenticodeSignature -LiteralPath $dp -ErrorAction Stop
+      $sigStatus = "$($sig.Status)"
+      if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+    } catch { }
+    if (-not $known -and $sigStatus -eq 'Valid') { continue }
+    $drvFlagged++
+    if ($drvFlagged -gt 25) { continue }
+    Add-Finding -Severity High -Category 'Hardening' -Title $(if ($known) { 'Known-vulnerable driver loaded: {0}' -f $leaf } else { 'Running driver without a valid signature: {0} ({1})' -f $leaf, $sigStatus }) `
+      -Detail ('Service: {0} | Path: {1} | Signature: {2}{3}{4}' -f $drv.Name, $dp, $sigStatus, $(if ($signer) { ' (' + (($signer -split ',')[0] -replace '^CN=', '') + ')' } else { '' }), $(if ($known) { ' | On the LOLDrivers vulnerable-driver list: a signed driver with a known kernel read/write primitive.' } else { '' })) `
+      -Evidence ('{0} :: SHA256 {1}' -f $dp, (Get-SuspectHash $dp)) `
+      -Remediation $(if ($known) { 'Unload and remove the driver unless the owning product is required; enable the Microsoft vulnerable driver blocklist and HVCI. MITRE T1068 / T1562.001.' } else { 'A running driver that fails signature validation means test-signing, a tampered file or a BYOVD loader. Verify bcdedit testsigning and investigate the file. MITRE T1014.' })
+  }
+  if ($drvFlagged -gt 25) {
+    Add-Finding -Severity High -Category 'Hardening' -Title ('{0} running drivers flagged for signature or vulnerable-driver list (first 25 listed)' -f $drvFlagged)
+  }
+  Add-Finding -Severity Info -Category 'Hardening' -Title ('Running kernel drivers checked: {0} ({1} flagged, {2} file not found)' -f $drvChecked, $drvFlagged, $drvMissing) `
+    -Detail 'Each running driver file was signature-checked and compared against the LOLDrivers name list.'
+} catch {
+  Add-Finding -Severity Info -Category 'Hardening' -Title 'Running driver signatures not assessed' -Detail ('Win32_SystemDriver read failed: ' + $_.Exception.Message)
 }
 
 # --- Firewall logging ------------------------------------------------------------
