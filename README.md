@@ -48,7 +48,7 @@ pwsh -File WinHostPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStam
 | `-NoLaunch` | Do not open the HTML dashboard; use this for unattended runs |
 | `-Obfuscate` | Randomized report filenames and a generic tool label |
 
-Reference runtimes on a Windows 11 workstation: about 35 seconds by default, about 2 minutes with `-FullCheck`.
+Reference runtimes on a Windows 11 workstation with a few hundred programs installed: about 80 seconds by default (the inventory adds about 10), longer with `-FullCheck`.
 
 ## Run it elevated
 
@@ -105,6 +105,16 @@ ARP and neighbour cache plus established-connection inventory, with MAC-OUI vend
 ### Service and OT inventory
 
 Local listeners mapped to owning process and binary version, against a port dictionary covering IT services and BMS/OT protocols (Modbus/TCP 502, BACnet 47808, EtherNet/IP 44818, OPC-UA 4840/4843, DNP3 20000, Niagara Fox, Omron FINS, CoDeSys). OT listeners are flagged with IEC 62443 SR 5.1 zone and conduit remediation. Installed software is matched against a BMS vendor dictionary so controller and HMI software is versioned for CVE watchlisting.
+
+### Asset inventory
+
+Three lists, written as separate CSV files next to the findings and shown as filterable tables at the bottom of the HTML report (and under `Inventory` in the JSON):
+
+- **Services:** every service with state, start mode, account, binary path, and the binary's company and version.
+- **Installed programs:** the 64-bit and 32-bit Uninstall keys plus every loaded user hive, so per-user installs (which skip admin approval) are included and labeled with their owner.
+- **Program folders:** every top-level folder under Program Files and Program Files (x86), plus the ProgramData and user AppData (`Local`, `Local\Programs`, `Roaming`) folders that hold real executables. Installer and updater stubs do not count, and each folder is named by its largest executable.
+
+Findings summarize the lists and point at what deserves a look: third-party services, services running from ProgramData or a user profile, per-user installs, programs living in AppData, and folders whose programs never registered an uninstall entry (portable tools and leftovers that patch tooling cannot see). Other users' AppData is only readable elevated; a non-elevated run names the profiles it skipped.
 
 ### Loopback and tunnel detection
 
@@ -172,8 +182,8 @@ The `Persistence` and `PrivEsc` categories double as regression tests. A finishe
 
 1. Copy `WinHostPEAS.ps1` to a share, or push it with your deployment tool.
 2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\WinHostPEAS.ps1 -OutputDir \\server\share\WinHostPEAS -FullCheck -NoLaunch`
-3. Each host writes `WinHostPEAS_<HOST>_<timestamp>.{json,csv,html}`.
-4. Triage on exit code, or ingest the JSON into a SIEM or CMDB. The schema is stable: one array of finding objects under `Findings`, with a `Meta` block.
+3. Each host writes `WinHostPEAS_<HOST>_<timestamp>.{json,csv,html}`, plus `_inventory_services.csv`, `_inventory_software.csv` and `_inventory_folders.csv` with the same prefix.
+4. Triage on exit code, or ingest the JSON into a SIEM or CMDB. The schema is stable: one array of finding objects under `Findings`, a `Meta` block, and the three inventory lists under `Inventory`.
 
 Run it elevated. See the elevation section above for what you lose otherwise.
 

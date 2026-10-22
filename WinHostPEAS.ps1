@@ -99,8 +99,45 @@ function Write-Reports {
     TotalFindings = $script:Findings.Count
     HighestSeverity = Get-HighestSeverity
   }
-  @{ Meta = $meta; Findings = $script:Findings } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
+  $inv = $script:Inventory
+  @{ Meta = $meta; Findings = $script:Findings; Inventory = $inv } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
   $script:Findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+
+  $invCsvs = @()
+  $invHtml = ''
+  if ($inv) {
+    foreach ($k in 'Services', 'Software', 'Folders') {
+      $rows = @($inv[$k])
+      if ($rows.Count -eq 0) { continue }
+      $p = Join-Path $Dir ('{0}_inventory_{1}.csv' -f $baseName, $k.ToLower())
+      $rows | Export-Csv -Path $p -NoTypeInformation -Encoding UTF8
+      $invCsvs += $p
+    }
+    $toJs = { param($a) (ConvertTo-Json -InputObject @($a) -Depth 3 -Compress).Replace('<', ([char]0x5c + 'u003c')) }
+    $invHtml = @"
+ <h2 style="font-size:18px;margin:28px 0 6px">Inventory</h2>
+ <p class="count">Everything installed on this host. The same lists are saved as CSV files next to this report.</p>
+ <details class="inv" open><summary>Services (<span id="n_svc"></span>)</summary><input type="text" placeholder="Filter services..." oninput="invRender('svc',this.value)"><div id="t_svc"></div></details>
+ <details class="inv"><summary>Installed programs (<span id="n_sw"></span>)</summary><input type="text" placeholder="Filter programs..." oninput="invRender('sw',this.value)"><div id="t_sw"></div></details>
+ <details class="inv"><summary>Program folders: Program Files, ProgramData, AppData (<span id="n_fo"></span>)</summary><input type="text" placeholder="Filter folders..." oninput="invRender('fo',this.value)"><div id="t_fo"></div></details>
+<script>
+const INV = {
+ svc: { rows: $(& $toJs $inv.Services), cols: ['Name','DisplayName','State','StartMode','RunsAs','Location','Company','Version','Binary'] },
+ sw:  { rows: $(& $toJs $inv.Software), cols: ['Name','Version','Publisher','InstallDate','Scope','User','Architecture','InstallLocation'] },
+ fo:  { rows: $(& $toJs $inv.Folders),  cols: ['Area','User','Folder','Executables','MainProgram','Company','Version','LastWrite','Path'] }
+};
+function invEsc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+function invRender(k,q){
+  const t=INV[k]; q=(q||'').toLowerCase();
+  const rows=t.rows.filter(r=>!q||t.cols.some(c=>String(r[c]==null?'':r[c]).toLowerCase().includes(q)));
+  document.getElementById('n_'+k).textContent = rows.length===t.rows.length ? t.rows.length : rows.length+' of '+t.rows.length;
+  document.getElementById('t_'+k).innerHTML='<table><thead><tr>'+t.cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+t.cols.map(c=>'<td>'+invEsc(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+}
+['svc','sw','fo'].forEach(k=>invRender(k,''));
+</script>
+"@
+  }
 
   $sevOrder = 'Critical','High','Medium','Low','Info'
   $counts = @{}
@@ -173,6 +210,10 @@ function Write-Reports {
  .never{color:#b91c1c;font-weight:600}
  .adm{color:#b91c1c}
  .dis{color:#94a3b8}
+ details.inv{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;margin:10px 0}
+ details.inv summary{cursor:pointer;font-weight:600;font-size:14px}
+ details.inv input{margin:10px 0}
+ details.inv table{font-size:12px}
 </style></head><body>
 <header>
  <h1>$(if ($Obfuscate) { "Posture Audit" } else { "WinHostPEAS Posture Audit" }) &mdash; $($env:COMPUTERNAME)</h1>
@@ -208,6 +249,7 @@ function Write-Reports {
  </div>
  <p class="count" id="count"></p>
  <table id="tbl"><thead><tr><th style="width:70px">Severity</th><th style="width:130px">Category</th><th>Finding</th><th>Detail / Evidence</th><th style="width:28%">Remediation</th></tr></thead><tbody id="tbody"></tbody></table>
+`$invHtmlPlaceholder
 </main>
 <script>
 const F = [
@@ -243,6 +285,7 @@ render();
   $htmlDoc = $htmlDoc.Replace('$tilesPlaceholder', ($tiles -join ''))
   $htmlDoc = $htmlDoc.Replace('$catOptsPlaceholder', ($catOpts -join ''))
   $htmlDoc = $htmlDoc.Replace('$rowsJsPlaceholder', ($rowsJs -join "`n"))
+  $htmlDoc = $htmlDoc.Replace('$invHtmlPlaceholder', $invHtml)
   Set-Content -Path $html -Value $htmlDoc -Encoding UTF8
 
   Write-Host ''
@@ -250,6 +293,7 @@ render();
   Write-Host ('Reports written: ' + $json) -ForegroundColor Cyan
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
+  foreach ($p in $invCsvs) { Write-Host ('                ' + $p) -ForegroundColor Cyan }
 
   if ($LaunchHtml -and -not $NoLaunch) {
     try {
@@ -315,28 +359,47 @@ function Start-ACLCheck {
 }
 
 function Get-InstalledApplications {
+  if ($null -ne $script:InstalledAppsCache) { return $script:InstalledAppsCache }
+  $uninst = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
   $roots = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    @{ Path = "HKLM:\$uninst"; Scope = 'Machine'; Arch = 'x64'; Sid = '' },
+    @{ Path = 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; Scope = 'Machine'; Arch = 'x86'; Sid = '' }
   )
-  foreach ($root in $roots) {
-    if (-not (Test-Path $root)) { continue }
-    $arch = if ($root -match 'Wow6432Node') { 'x86' } else { 'x64' }
-    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+
+  $userHives = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+    Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })
+  if ($userHives.Count -eq 0) {
+    $roots += @{ Path = "HKCU:\$uninst"; Scope = 'User'; Arch = 'x64'; Sid = '' }
+  }
+  foreach ($h in $userHives) {
+    $roots += @{ Path = "Registry::HKEY_USERS\$($h.PSChildName)\$uninst"; Scope = 'User'; Arch = 'x64'; Sid = $h.PSChildName }
+  }
+  $out = foreach ($root in $roots) {
+    if (-not (Test-Path $root.Path)) { continue }
+    $owner = ''
+    if ($root.Sid) {
+      try { $owner = ([System.Security.Principal.SecurityIdentifier]$root.Sid).Translate([System.Security.Principal.NTAccount]).Value } catch { $owner = $root.Sid }
+    }
+    Get-ChildItem $root.Path -ErrorAction SilentlyContinue | ForEach-Object {
       $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
       if ($props -and $props.DisplayName) {
         [pscustomobject]@{
-          Computername = $env:COMPUTERNAME
-          Software     = $props.DisplayName
-          Version      = $props.DisplayVersion
-          Publisher    = $props.Publisher
-          InstallDate  = $props.InstallDate
-          Architecture = $arch
+          Computername    = $env:COMPUTERNAME
+          Software        = $props.DisplayName
+          Version         = $props.DisplayVersion
+          Publisher       = $props.Publisher
+          InstallDate     = $props.InstallDate
+          Architecture    = $root.Arch
+          Scope           = $root.Scope
+          User            = $owner
+          InstallLocation = $props.InstallLocation
+          Hidden          = [bool]($props.SystemComponent -eq 1 -or $props.ParentKeyName)
         }
       }
     }
   }
+  $script:InstalledAppsCache = @($out | Sort-Object Software, Version)
+  return $script:InstalledAppsCache
 }
 
 function Get-NtlmPolicySummary {
@@ -2057,8 +2120,6 @@ if ($null -ne $adcs.MappingValue -and $adcs.UpnMapping) {
 Start-Section 'INSTALLED SOFTWARE (baseline inventory)'
 try {
   $apps = @(Get-InstalledApplications)
-  Add-Finding -Severity Info -Category 'Software' -Title ('{0} installed applications recorded' -f $apps.Count) `
-    -Detail 'Full inventory in reports; diff against build baseline to catch unauthorized software.'
   $riskyNames = @('VNC', 'Telnet', 'WinSCP', 'FileZilla', 'uTorrent', 'TeamViewer')
   foreach ($r in $riskyNames) {
     $hit = $apps | Where-Object { $_.Software -match $r }
@@ -5043,6 +5104,245 @@ try {
 }
 catch {
   Add-Finding -Severity Info -Category 'Detection' -Title 'Host telemetry roll-up not assessed' -Detail ('Roll-up failed: ' + $_.Exception.Message)
+}
+
+Start-Section 'INVENTORY (services, installed programs, program folders)'
+
+$script:Inventory = [ordered]@{ Services = @(); Software = @(); Folders = @() }
+$invMax = 40   
+
+function Format-InvList {
+  param([string[]]$Items, [int]$Max = 40)
+  $Items = @($Items | Where-Object { $_ })
+  if ($Items.Count -le $Max) { return ($Items -join ', ') }
+  return (($Items | Select-Object -First $Max) -join ', ') + (' ... and {0} more (full list in the inventory report)' -f ($Items.Count - $Max))
+}
+
+function Get-InvLocation {
+  param([string]$Path)
+  if (-not $Path) { return 'Unknown' }
+  $p = $Path.ToLower()
+  $win = $env:SystemRoot.ToLower()
+  $pf = $env:ProgramFiles.ToLower()
+  $pf86 = if (${env:ProgramFiles(x86)}) { ${env:ProgramFiles(x86)}.ToLower() } else { '<none>' }
+  $pd = $env:ProgramData.ToLower()
+  $users = (Split-Path $env:PUBLIC -Parent).ToLower()
+  if ($p.StartsWith($win + '\')) { return 'Windows' }
+  if ($p.StartsWith($pf86 + '\')) { return 'Program Files (x86)' }
+  if ($p.StartsWith($pf + '\')) { return 'Program Files' }
+  if ($p.StartsWith($pd + '\')) { return 'ProgramData' }
+  if ($p.StartsWith($users + '\')) { return 'User profile' }
+  return 'Other'
+}
+
+function Get-InvFileVersion {
+  param([string]$Path)
+  try {
+    if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+      $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
+      return [pscustomobject]@{ Company = $vi.CompanyName; Product = $vi.ProductName; Version = $vi.FileVersion }
+    }
+  } catch { }
+  return [pscustomobject]@{ Company = ''; Product = ''; Version = '' }
+}
+
+function Get-InvFolderExes {
+  param([string]$Root, [int]$MaxDepth = 3, [int]$MaxDirs = 400)
+  $exes = New-Object System.Collections.Generic.List[string]
+  $queue = New-Object System.Collections.Generic.Queue[object]
+  $queue.Enqueue(@($Root, 0))
+  $visited = 0; $truncated = $false
+  while ($queue.Count -gt 0) {
+    $item = $queue.Dequeue(); $dir = $item[0]; $depth = $item[1]
+    $visited++
+    if ($visited -gt $MaxDirs) { $truncated = $true; break }
+    try {
+      foreach ($f in [System.IO.Directory]::EnumerateFiles($dir, '*.exe')) { $exes.Add($f) }
+    } catch { }
+    if ($depth -lt $MaxDepth) {
+      try {
+        foreach ($d in [System.IO.Directory]::EnumerateDirectories($dir)) {
+          try {
+            if (([System.IO.File]::GetAttributes($d) -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) { $queue.Enqueue(@($d, ($depth + 1))) }
+          } catch { }
+        }
+      } catch { }
+    }
+  }
+  return [pscustomobject]@{ Exes = $exes; Truncated = $truncated }
+}
+
+$invSvcSource = $script:PeasServices
+if (-not $invSvcSource -or @($invSvcSource).Count -eq 0) {
+  try { $invSvcSource = @(Get-CimInstance Win32_Service -ErrorAction Stop) } catch { $invSvcSource = @() }
+}
+$fvCache = @{}
+$script:Inventory.Services = @(foreach ($s in $invSvcSource) {
+  $exe = Get-ServiceExePath $s.PathName
+  if ($exe -and -not $fvCache.ContainsKey($exe)) { $fvCache[$exe] = Get-InvFileVersion $exe }
+  $fv = if ($exe) { $fvCache[$exe] } else { $null }
+  [pscustomobject]@{
+    Name        = $s.Name
+    DisplayName = $s.DisplayName
+    State       = $s.State
+    StartMode   = $s.StartMode
+    RunsAs      = $s.StartName
+    Location    = Get-InvLocation $exe
+    Company     = if ($fv) { $fv.Company } else { '' }
+    Version     = if ($fv) { $fv.Version } else { '' }
+    Binary      = $exe
+    CommandLine = $s.PathName
+  }
+}) | Sort-Object Name
+
+$svcAll = @($script:Inventory.Services)
+if ($svcAll.Count -eq 0) {
+  Add-Finding -Severity Info -Category 'Inventory' -Title 'Service inventory not assessed' `
+    -Detail 'The service list could not be read (Win32_Service query failed).' `
+    -Remediation 'Rerun from an account that can query WMI.'
+}
+else {
+  $svcRun = @($svcAll | Where-Object { $_.State -eq 'Running' }).Count
+  $svcAuto = @($svcAll | Where-Object { $_.StartMode -eq 'Auto' }).Count
+
+  $svc3p = @($svcAll | Where-Object { $_.Location -ne 'Windows' -and $_.Company -notmatch 'Microsoft' })
+  Add-Finding -Severity Info -Category 'Inventory' -Title ('{0} services installed ({1} running, {2} start automatically, {3} third-party)' -f $svcAll.Count, $svcRun, $svcAuto, $svc3p.Count) `
+    -Detail ('Third-party services: ' + (Format-InvList -Max $invMax -Items ($svc3p | ForEach-Object {
+          '{0} [{1}, {2}{3}]' -f $_.Name, $_.State, $_.RunsAs, $(if ($_.Company) { ', ' + $_.Company } else { '' })
+        }))) `
+    -Remediation 'Compare the third-party services against the approved software list for this host role; remove or disable anything nobody can account for.'
+
+  $svcUser = @($svc3p | Where-Object { $_.Location -in 'User profile', 'ProgramData' })
+  if ($svcUser.Count -gt 0) {
+    Add-Finding -Severity Low -Category 'Inventory' -Title ('{0} services run programs from ProgramData or a user profile' -f $svcUser.Count) `
+      -Detail (Format-InvList -Max $invMax -Items ($svcUser | ForEach-Object { '{0} ({1}) -> {2}' -f $_.Name, $_.RunsAs, $_.Binary })) `
+      -Remediation 'Services normally run from Program Files, where ordinary users cannot write. Check the folder permissions (see the Privilege Escalation findings) and move these installs to Program Files where the vendor allows it.'
+  }
+}
+
+$swAll = @(Get-InstalledApplications | Where-Object { -not $_.Hidden })
+$script:Inventory.Software = @($swAll | ForEach-Object {
+    [pscustomobject]@{
+      Name            = $_.Software
+      Version         = $_.Version
+      Publisher       = $_.Publisher
+      InstallDate     = $_.InstallDate
+      Scope           = $_.Scope
+      User            = $_.User
+      Architecture    = $_.Architecture
+      InstallLocation = $_.InstallLocation
+      Location        = Get-InvLocation $_.InstallLocation
+    }
+  })
+$swMachine = @($swAll | Where-Object { $_.Scope -eq 'Machine' }).Count
+$swUser = @($swAll | Where-Object { $_.Scope -eq 'User' })
+Add-Finding -Severity Info -Category 'Inventory' -Title ('{0} installed programs ({1} for all users, {2} per-user)' -f $swAll.Count, $swMachine, $swUser.Count) `
+  -Detail 'Read from the Uninstall registry keys (64-bit, 32-bit and every loaded user hive). The full list with versions and publishers is in the inventory report.' `
+  -Remediation 'Feed this list to the asset or vulnerability management system and remove programs the host role does not need.'
+if ($swUser.Count -gt 0) {
+  Add-Finding -Severity Low -Category 'Inventory' -Title ('{0} programs installed per-user, without admin rights' -f $swUser.Count) `
+    -Detail (Format-InvList -Max $invMax -Items ($swUser | ForEach-Object {
+          $n = $_.Software; $v = [string]$_.Version
+          if ($v -and $n.EndsWith($v)) { $v = '' }
+          ('{0} {1}{2}' -f $n, $v, $(if ($_.User) { ' (' + ($_.User -replace '^.*\\', '') + ')' } else { '' })) -replace '\s{2,}', ' '
+        })) `
+    -Remediation 'Per-user installs skip admin approval and are often missed by software inventory and patching tools. Confirm each is approved and patched; application control (WDAC or AppLocker) can block programs from running out of user profiles.'
+}
+
+$invRoots = New-Object System.Collections.Generic.List[object]
+foreach ($r in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Select-Object -Unique) {
+  if ($r -and (Test-Path -LiteralPath $r)) { $invRoots.Add([pscustomobject]@{ Root = $r; Area = (Get-InvLocation ($r + '\x')); User = ''; ExeOnly = $false }) }
+}
+if ($env:ProgramData -and (Test-Path -LiteralPath $env:ProgramData)) {
+  $invRoots.Add([pscustomobject]@{ Root = $env:ProgramData; Area = 'ProgramData'; User = ''; ExeOnly = $true })
+}
+$profRoot = Split-Path $env:PUBLIC -Parent
+$profUnread = New-Object System.Collections.Generic.List[string]
+foreach ($prof in @(Get-ChildItem -LiteralPath $profRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+  if ($prof.Name -in 'Public', 'Default', 'Default User', 'All Users' -or ($prof.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
+  $sub = @('AppData\Local\Programs', 'AppData\Local', 'AppData\Roaming')
+  $readable = $false
+  foreach ($s in $sub) {
+    $p = Join-Path $prof.FullName $s
+    try { [void][System.IO.Directory]::EnumerateDirectories($p).GetEnumerator().MoveNext(); $readable = $true } catch { continue }
+    $invRoots.Add([pscustomobject]@{ Root = $p; Area = ('AppData (' + ($s -replace '^AppData\\', '') + ')'); User = $prof.Name; ExeOnly = $true })
+  }
+  if (-not $readable) { $profUnread.Add($prof.Name) }
+}
+
+$folders = New-Object System.Collections.Generic.List[object]
+$seen = @{}
+foreach ($root in $invRoots) {
+  $children = @()
+  try { $children = @([System.IO.Directory]::EnumerateDirectories($root.Root)) } catch { continue }
+  foreach ($d in $children) {
+    $key = $d.ToLower()
+    if ($seen.ContainsKey($key)) { continue }   
+    $seen[$key] = $true
+    $leaf = Split-Path $d -Leaf
+    if ($root.Root -match '\\AppData\\Local$' -and $leaf -eq 'Programs') { continue }
+    try { if (([System.IO.File]::GetAttributes($d) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue } } catch { continue }
+    $walk = Get-InvFolderExes -Root $d
+    $exeCount = $walk.Exes.Count
+
+    $progExes = @($walk.Exes | Where-Object { (Split-Path $_ -Leaf) -notmatch '^(installer|setup.*|unins.*|uninstall.*|update|updater|squirrel|.*_installer|.*-setup.*)\.exe$' })
+    if ($root.ExeOnly -and $progExes.Count -eq 0) { continue }
+    $main = $null; $mainSize = -1
+    foreach ($e in $progExes) {
+      try { $len = ([System.IO.FileInfo]$e).Length; if ($len -gt $mainSize) { $mainSize = $len; $main = $e } } catch { }
+    }
+    $fv = if ($main) { Get-InvFileVersion $main } else { $null }
+    $lastWrite = ''
+    try { $lastWrite = [System.IO.Directory]::GetLastWriteTime($d).ToString('yyyy-MM-dd') } catch { }
+    $folders.Add([pscustomobject]@{
+        Area       = $root.Area
+        User       = $root.User
+        Folder     = $leaf
+        Executables = $(if ($walk.Truncated) { "$exeCount+" } else { "$exeCount" })
+        MainProgram = $(if ($main) { Split-Path $main -Leaf } else { '' })
+        Company    = $(if ($fv) { $fv.Company } else { '' })
+        Version    = $(if ($fv) { $fv.Version } else { '' })
+        LastWrite  = $lastWrite
+        Path       = $d
+      })
+  }
+}
+$script:Inventory.Folders = @($folders | Sort-Object Area, User, Folder)
+
+$byArea = $script:Inventory.Folders | Group-Object Area | Sort-Object Name
+Add-Finding -Severity Info -Category 'Inventory' -Title ('{0} program folders found' -f $script:Inventory.Folders.Count) `
+  -Detail ((($byArea | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Count }) -join ' | ') + '. Program Files lists every top-level folder; ProgramData and AppData list only folders that contain executables (searched 3 levels deep).') `
+  -Remediation 'Use the folder list to find software that never registered an uninstall entry (portable apps, copied tools, leftovers).'
+
+$appDataProgs = @($script:Inventory.Folders | Where-Object { $_.Area -like 'AppData*' })
+if ($appDataProgs.Count -gt 0) {
+  Add-Finding -Severity Low -Category 'Inventory' -Title ('{0} programs live in user AppData folders' -f $appDataProgs.Count) `
+    -Detail (Format-InvList -Max $invMax -Items ($appDataProgs | ForEach-Object {
+          '{0}\{1}{2}' -f $_.User, $_.Folder, $(if ($_.MainProgram) { ' (' + $_.MainProgram + ')' } else { '' })
+        })) `
+    -Remediation 'Programs in AppData are writable by the user who runs them, so malware can replace them, and they often miss patching. Confirm each is expected; block execution from AppData with WDAC or AppLocker where the business allows it.'
+}
+
+$knownLocs = @($swAll | Where-Object { $_.InstallLocation } | ForEach-Object { $_.InstallLocation.TrimEnd('\').ToLower() })
+$unregistered = @(foreach ($fo in $script:Inventory.Folders) {
+    if ($fo.Executables -eq '0' -or $fo.Area -like 'Program Files*' -or $fo.Company -match 'Microsoft') { continue }
+    $fp = $fo.Path.ToLower()
+    $hit = $false
+    foreach ($k in $knownLocs) { if ($k -eq $fp -or $k.StartsWith($fp + '\') -or $fp.StartsWith($k + '\')) { $hit = $true; break } }
+    if (-not $hit) { $fo }
+  })
+if ($unregistered.Count -gt 0) {
+  Add-Finding -Severity Info -Category 'Inventory' -Title ('{0} folders in ProgramData or AppData hold programs that are not in the installed-programs list' -f $unregistered.Count) `
+    -Detail (Format-InvList -Max $invMax -Items ($unregistered | ForEach-Object {
+          '{0}{1}{2}' -f $(if ($_.User) { $_.User + '\' } else { 'ProgramData\' }), $_.Folder, $(if ($_.MainProgram) { ' (' + $_.MainProgram + ')' } else { '' })
+        })) `
+    -Remediation 'These are portable tools, auto-updaters, or leftovers from removed software. Patch tooling does not see them; confirm each is wanted.'
+}
+
+if ($profUnread.Count -gt 0) {
+  Add-Finding -Severity Info -Category 'Inventory' -Title ('AppData not assessed for {0} user profiles (access denied)' -f $profUnread.Count) `
+    -Detail ('Profiles: ' + ($profUnread -join ', ')) `
+    -Remediation 'Run elevated to inventory programs in every user profile.'
 }
 
 Start-Section 'SUMMARY'

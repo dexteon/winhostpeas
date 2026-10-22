@@ -88,8 +88,47 @@ function Write-Reports {
     TotalFindings = $script:Findings.Count
     HighestSeverity = Get-HighestSeverity
   }
-  @{ Meta = $meta; Findings = $script:Findings } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
+  $inv = $script:Inventory
+  @{ Meta = $meta; Findings = $script:Findings; Inventory = $inv } | ConvertTo-Json -Depth 4 | Set-Content -Path $json -Encoding UTF8
   $script:Findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+
+  # Inventory CSVs: one file per list, next to the findings CSV.
+  $invCsvs = @()
+  $invHtml = ''
+  if ($inv) {
+    foreach ($k in 'Services', 'Software', 'Folders') {
+      $rows = @($inv[$k])
+      if ($rows.Count -eq 0) { continue }
+      $p = Join-Path $Dir ('{0}_inventory_{1}.csv' -f $baseName, $k.ToLower())
+      $rows | Export-Csv -Path $p -NoTypeInformation -Encoding UTF8
+      $invCsvs += $p
+    }
+    # JSON for the HTML tables. '<' is escaped so no value can close the script tag.
+    $toJs = { param($a) (ConvertTo-Json -InputObject @($a) -Depth 3 -Compress).Replace('<', ([char]0x5c + 'u003c')) }
+    $invHtml = @"
+ <h2 style="font-size:18px;margin:28px 0 6px">Inventory</h2>
+ <p class="count">Everything installed on this host. The same lists are saved as CSV files next to this report.</p>
+ <details class="inv" open><summary>Services (<span id="n_svc"></span>)</summary><input type="text" placeholder="Filter services..." oninput="invRender('svc',this.value)"><div id="t_svc"></div></details>
+ <details class="inv"><summary>Installed programs (<span id="n_sw"></span>)</summary><input type="text" placeholder="Filter programs..." oninput="invRender('sw',this.value)"><div id="t_sw"></div></details>
+ <details class="inv"><summary>Program folders: Program Files, ProgramData, AppData (<span id="n_fo"></span>)</summary><input type="text" placeholder="Filter folders..." oninput="invRender('fo',this.value)"><div id="t_fo"></div></details>
+<script>
+const INV = {
+ svc: { rows: $(& $toJs $inv.Services), cols: ['Name','DisplayName','State','StartMode','RunsAs','Location','Company','Version','Binary'] },
+ sw:  { rows: $(& $toJs $inv.Software), cols: ['Name','Version','Publisher','InstallDate','Scope','User','Architecture','InstallLocation'] },
+ fo:  { rows: $(& $toJs $inv.Folders),  cols: ['Area','User','Folder','Executables','MainProgram','Company','Version','LastWrite','Path'] }
+};
+function invEsc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+function invRender(k,q){
+  const t=INV[k]; q=(q||'').toLowerCase();
+  const rows=t.rows.filter(r=>!q||t.cols.some(c=>String(r[c]==null?'':r[c]).toLowerCase().includes(q)));
+  document.getElementById('n_'+k).textContent = rows.length===t.rows.length ? t.rows.length : rows.length+' of '+t.rows.length;
+  document.getElementById('t_'+k).innerHTML='<table><thead><tr>'+t.cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+t.cols.map(c=>'<td>'+invEsc(r[c])+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+}
+['svc','sw','fo'].forEach(k=>invRender(k,''));
+</script>
+"@
+  }
 
   # ---------- HTML dashboard ----------
   $sevOrder = 'Critical','High','Medium','Low','Info'
@@ -164,6 +203,10 @@ function Write-Reports {
  .never{color:#b91c1c;font-weight:600}
  .adm{color:#b91c1c}
  .dis{color:#94a3b8}
+ details.inv{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;margin:10px 0}
+ details.inv summary{cursor:pointer;font-weight:600;font-size:14px}
+ details.inv input{margin:10px 0}
+ details.inv table{font-size:12px}
 </style></head><body>
 <header>
  <h1>$(if ($Obfuscate) { "Posture Audit" } else { "WinHostPEAS Posture Audit" }) &mdash; $($env:COMPUTERNAME)</h1>
@@ -199,6 +242,7 @@ function Write-Reports {
  </div>
  <p class="count" id="count"></p>
  <table id="tbl"><thead><tr><th style="width:70px">Severity</th><th style="width:130px">Category</th><th>Finding</th><th>Detail / Evidence</th><th style="width:28%">Remediation</th></tr></thead><tbody id="tbody"></tbody></table>
+`$invHtmlPlaceholder
 </main>
 <script>
 const F = [
@@ -234,6 +278,7 @@ render();
   $htmlDoc = $htmlDoc.Replace('$tilesPlaceholder', ($tiles -join ''))
   $htmlDoc = $htmlDoc.Replace('$catOptsPlaceholder', ($catOpts -join ''))
   $htmlDoc = $htmlDoc.Replace('$rowsJsPlaceholder', ($rowsJs -join "`n"))
+  $htmlDoc = $htmlDoc.Replace('$invHtmlPlaceholder', $invHtml)
   Set-Content -Path $html -Value $htmlDoc -Encoding UTF8
 
   Write-Host ''
@@ -241,6 +286,7 @@ render();
   Write-Host ('Reports written: ' + $json) -ForegroundColor Cyan
   Write-Host ('                ' + $csv)  -ForegroundColor Cyan
   Write-Host ('                ' + $html) -ForegroundColor Cyan
+  foreach ($p in $invCsvs) { Write-Host ('                ' + $p) -ForegroundColor Cyan }
 
   # Auto-launch the HTML report in the default browser (interactive runs).
   if ($LaunchHtml -and -not $NoLaunch) {
