@@ -5,6 +5,31 @@
 # All checks are read-only (ServerManager API + config files).
 
 Start-Section 'IIS WEB SERVER RECON'
+
+# Web-root write check by SID, so it works on any OS language. Beyond the shared
+# low-privilege set, the IIS worker identities count here: IIS_IUSRS
+# (S-1-5-32-568), IUSR (S-1-5-17) and application pool identities (S-1-5-82-*).
+# A web root those can write to is a webshell drop point.
+function Get-IisWriteAce {
+  param($ACLObject)
+  if (-not $ACLObject) { return $null }
+  $hit = Get-LowPrivWriteAce -ACLObject $ACLObject
+  if ($hit) { return $hit }
+  foreach ($ace in $ACLObject.Access) {
+    if ($ace.AccessControlType -ne 'Allow') { continue }
+    if ("$($ace.PropagationFlags)" -match 'InheritOnly') { continue }
+    $sid = $null
+    try { $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+    if (-not ($sid -eq 'S-1-5-32-568' -or $sid -eq 'S-1-5-17' -or $sid -like 'S-1-5-82-*')) { continue }
+    $rights = "$($ace.FileSystemRights)"
+    if ($rights -notmatch $script:WriteRightsRx) { continue }
+    $name = switch -Wildcard ($sid) { 'S-1-5-32-568' { 'IIS_IUSRS' } 'S-1-5-17' { 'IUSR' } default { 'IIS AppPool identity' } }
+    $level = if ($rights -match 'FullControl') { 'FullControl' } elseif ($rights -match 'Modify') { 'Modify' } else { 'Write' }
+    return [pscustomobject]@{ Name = $name; Sid = $sid; Level = $level; Rights = $rights }
+  }
+  return $null
+}
+
 $iisPresent = $false
 $sm = $null
 $adminDll = "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll"
@@ -46,15 +71,14 @@ else {
       foreach ($app in $site.Applications) {
         $root = $app.VirtualDirectories | Select-Object -First 1
         if ($root -and $root.PhysicalPath -and (Test-Path $root.PhysicalPath)) {
-          $acl = Get-Acl $root.PhysicalPath -ErrorAction SilentlyContinue
+          $acl = $null
+          try { $acl = Get-Acl -LiteralPath $root.PhysicalPath -ErrorAction SilentlyContinue } catch { }
           if ($acl) {
-            $w = $acl.Access | Where-Object {
-              $_.IdentityReference -match 'BUILTIN\\Users|Everyone|IIS_IUSRS' -and
-              $_.AccessControlType -eq 'Allow' -and "$($_.FileSystemRights)" -match 'FullControl|Modify|Write'
-            }
+            $w = Get-IisWriteAce -ACLObject $acl
             if ($w) {
               Add-Finding -Severity High -Category 'IIS' -Title ("Web root writable by non-admin: {0}" -f $root.PhysicalPath) `
-                -Detail ("Site: {0} | {1} granted {2} - webshell drop-in." -f $site.Name, $w[0].IdentityReference, $w[0].FileSystemRights) `
+                -Detail ("Site: {0} | {1} ({2}) granted {3} - webshell drop-in." -f $site.Name, $w.Name, $w.Sid, $w.Rights) `
+                -Evidence $root.PhysicalPath `
                 -Remediation 'Web roots should be read-only for app-pool identities and Users; writers need explicit ACLs.'
             }
           }
@@ -176,7 +200,7 @@ else {
 
   # --- Server-level auth config from applicationHost.config ---
   $appHost = "$env:windir\System32\inetsrv\config\applicationHost.config"
-  if (Test-Path $appHost) {
+  if (Test-Path $appHost -ErrorAction SilentlyContinue) {
     $ah = $null
     try { $ah = Get-Content $appHost -Raw } catch { }
     if ($ah) {
@@ -200,16 +224,15 @@ else {
       }
     }
     # writable applicationHost.config = total IIS takeover
-    $aclAh = Get-Acl $appHost -ErrorAction SilentlyContinue
+    $aclAh = $null
+    try { $aclAh = Get-Acl -LiteralPath $appHost -ErrorAction SilentlyContinue } catch { }
     if ($aclAh) {
-      $weakAh = $aclAh.Access | Where-Object {
-        $_.IdentityReference -match 'BUILTIN\\Users|Everyone' -and $_.AccessControlType -eq 'Allow' -and
-        ("$($_.FileSystemRights)" -match 'FullControl|Modify|Write')
-      }
+      $weakAh = Get-IisWriteAce -ACLObject $aclAh
       if ($weakAh) {
         Add-Finding -Severity Critical -Category 'IIS' -Title 'applicationHost.config is user-writable' `
-          -Detail 'Edit = full control of every site/app pool on the box.' `
-          -Remediation 'Restore Administrators/SYSTEM/Administrators-only ACL immediately.'
+          -Detail ('{0} ({1}) has {2}. Edit = full control of every site/app pool on the box.' -f $weakAh.Name, $weakAh.Sid, $weakAh.Rights) `
+          -Evidence $appHost `
+          -Remediation 'Restore the Administrators/SYSTEM-only ACL immediately.'
       }
     }
   }
@@ -273,4 +296,48 @@ try {
   else {
     Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM service not present on this host'
   }
+}
+
+# --- WinRM CLIENT settings (readable without elevation) ---
+# TrustedHosts = * lets this host send its credentials to any name it is told to
+# connect to; AllowUnencrypted or Basic on the client side leaks them in clear.
+try {
+  $cliBase = 'WSMan:\localhost\Client'
+  if (Test-Path $cliBase) {
+    $trusted = "$((Get-Item (Join-Path $cliBase 'TrustedHosts') -ErrorAction Stop).Value)".Trim()
+    $cliUnenc = "$((Get-Item (Join-Path $cliBase 'AllowUnencrypted') -ErrorAction SilentlyContinue).Value)"
+    $cliBasic = "$((Get-Item (Join-Path $cliBase 'Auth\Basic') -ErrorAction SilentlyContinue).Value)"
+    $cliDigest = "$((Get-Item (Join-Path $cliBase 'Auth\Digest') -ErrorAction SilentlyContinue).Value)"
+    if ($trusted -eq '*' -or $trusted -match '(^|,)\s*\*\s*(,|$)') {
+      Add-Finding -Severity Medium -Category 'RemoteMgmt' -Title 'WinRM client TrustedHosts is * (any host)' `
+        -Detail ('TrustedHosts: {0}. NTLM credentials from this host are sent to any target name, so a spoofed or poisoned name (LLMNR, WPAD, DNS) collects admin credentials.' -f $trusted) `
+        -Evidence "$cliBase\TrustedHosts" `
+        -Remediation 'Clear TrustedHosts or list only the specific management targets; use Kerberos or HTTPS listeners instead of host trust.'
+    }
+    elseif ($trusted) {
+      Add-Finding -Severity Low -Category 'RemoteMgmt' -Title 'WinRM client TrustedHosts list is set' `
+        -Detail ('TrustedHosts: {0}. Each listed name receives this host''s NTLM credentials without mutual authentication.' -f $trusted) `
+        -Evidence "$cliBase\TrustedHosts" `
+        -Remediation 'Keep the list minimal and prefer Kerberos or HTTPS with certificate validation.'
+    }
+    if ($cliUnenc -eq 'true') {
+      Add-Finding -Severity Medium -Category 'RemoteMgmt' -Title 'WinRM client AllowUnencrypted = true' `
+        -Evidence "$cliBase\AllowUnencrypted" `
+        -Remediation 'Set the client AllowUnencrypted to false so outbound WinRM sessions always negotiate message encryption.'
+    }
+    if ($cliBasic -eq 'true' -or $cliDigest -eq 'true') {
+      Add-Finding -Severity Low -Category 'RemoteMgmt' -Title ('WinRM client allows {0} authentication' -f (@($(if ($cliBasic -eq 'true') { 'Basic' }), $(if ($cliDigest -eq 'true') { 'Digest' })) | Where-Object { $_ }) -join ' and ') `
+        -Evidence "$cliBase\Auth" `
+        -Remediation 'Disable Basic and Digest on the WinRM client (CIS 18.10.89.1.x); keep Kerberos and Negotiate.'
+    }
+    if (-not $trusted -and $cliUnenc -ne 'true' -and $cliBasic -ne 'true' -and $cliDigest -ne 'true') {
+      Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM client settings at secure defaults (no TrustedHosts, encrypted, no Basic/Digest)'
+    }
+  }
+  else {
+    Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM client settings not assessed' -Detail 'The WSMan client provider path is not available on this host.'
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'RemoteMgmt' -Title 'WinRM client settings not assessed' `
+    -Detail ('Reading WSMan:\localhost\Client failed: ' + $_.Exception.Message)
 }
