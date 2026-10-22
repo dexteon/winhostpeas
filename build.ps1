@@ -1,3 +1,6 @@
+# Usage: pwsh -File build.ps1 [-Deploy <path>]
+#   Writes WinHostPEAS.ps1 next to this script. -Deploy also copies it to <path>.
+param([string]$Deploy)
 $ErrorActionPreference = 'Stop'
 # Resolve from the script's own location, never a hardcoded path. A pinned path
 # is how the G:\Scratch copy and the D: repo silently drifted apart.
@@ -54,6 +57,9 @@ if ($e2.Count) {
 }
 $commentsLeft = @($t2 | Where-Object { $_.Kind.ToString() -eq 'Comment' }).Count
 
-Copy-Item $clean 'G:\Documents\WinHostPEAS.ps1' -Force
 $lines = (Get-Content $clean).Count
-Write-Host ("BUILD OK: {0} lines, {1} comments remaining. Shipped to G:\Documents\WinHostPEAS.ps1" -f $lines, $commentsLeft) -ForegroundColor Green
+Write-Host ("BUILD OK: {0} lines, {1} comments remaining. Wrote {2}" -f $lines, $commentsLeft, $clean) -ForegroundColor Green
+if ($Deploy) {
+  Copy-Item $clean $Deploy -Force
+  Write-Host ("Copied to {0}" -f $Deploy) -ForegroundColor Green
+}
