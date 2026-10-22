@@ -1537,6 +1537,7 @@ try {
   $anchor = $privRows | Where-Object { $_.Name -eq 'SeChangeNotifyPrivilege' } | Select-Object -First 1
   $enabledWord = if ($anchor) { "$($anchor.State)".Trim() } else { $null }
   $dangerHeld = 0
+  $elevPrivs = @()
   foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBackupPrivilege', 'SeRestorePrivilege',
                             'SeLoadDriverPrivilege', 'SeTakeOwnershipPrivilege', 'SeCreateTokenPrivilege', 'SeTcbPrivilege',
                             'SeAssignPrimaryTokenPrivilege')) {
@@ -1545,6 +1546,8 @@ try {
     $dangerHeld++
     $state = "$($row.State)".Trim()
     $isEnabled = if ($enabledWord) { $state -eq $enabledWord } else { $state -match '^Enabled$' }
+
+    if ($script:IsElevated) { $elevPrivs += $dangerPriv; continue }
     if ($isEnabled) {
       Add-Finding -Severity High -Category 'PrivEsc' -Title ("Current user holds {0} (enabled)" -f $dangerPriv) `
         -Detail 'Dangerous privilege - standard tooling can turn this into SYSTEM or credential access.' `
@@ -1555,6 +1558,11 @@ try {
         -Detail ('The privilege is in the token in a disabled state. Any process of this user can enable it with AdjustTokenPrivileges, so it is held, not absent. Token state: ' + $state) `
         -Remediation 'Remove the account from the granting group/local policy unless operationally required.'
     }
+  }
+  if ($elevPrivs.Count -gt 0) {
+    Add-Finding -Severity Info -Category 'PrivEsc' -Title ('Elevated admin token holds {0} sensitive privileges (expected for Administrators)' -f $elevPrivs.Count) `
+      -Detail ('{0}. Run the audit non-elevated as the everyday user to see what that account holds without elevation.' -f ($elevPrivs -join ', ')) `
+      -Remediation 'Keep daily work in a non-admin account so these privileges only exist after a deliberate elevation.'
   }
   if ($dangerHeld -eq 0) {
     Add-Finding -Severity Info -Category 'PrivEsc' -Title ('Current token holds none of the 9 dangerous privileges ({0} privileges listed by whoami /priv)' -f $privRows.Count)
