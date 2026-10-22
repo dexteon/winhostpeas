@@ -66,26 +66,47 @@ function Start-ACLCheck {
 # 32-bit (Wow6432Node) and per-user uninstall hives. Does not use the
 # remote-registry API and does not depend on the RemoteRegistry service.
 function Get-InstalledApplications {
+  # Cached: several sections call this and the registry walk is not free.
+  if ($null -ne $script:InstalledAppsCache) { return $script:InstalledAppsCache }
+  $uninst = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
   $roots = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    @{ Path = "HKLM:\$uninst"; Scope = 'Machine'; Arch = 'x64'; Sid = '' },
+    @{ Path = 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; Scope = 'Machine'; Arch = 'x86'; Sid = '' }
   )
-  foreach ($root in $roots) {
-    if (-not (Test-Path $root)) { continue }
-    $arch = if ($root -match 'Wow6432Node') { 'x86' } else { 'x64' }
-    Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+  # Per-user installs: every loaded user hive (the current user plus anyone
+  # else logged on). Profiles that are not loaded are not mounted, so not read.
+  $userHives = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+    Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })
+  if ($userHives.Count -eq 0) {
+    $roots += @{ Path = "HKCU:\$uninst"; Scope = 'User'; Arch = 'x64'; Sid = '' }
+  }
+  foreach ($h in $userHives) {
+    $roots += @{ Path = "Registry::HKEY_USERS\$($h.PSChildName)\$uninst"; Scope = 'User'; Arch = 'x64'; Sid = $h.PSChildName }
+  }
+  $out = foreach ($root in $roots) {
+    if (-not (Test-Path $root.Path)) { continue }
+    $owner = ''
+    if ($root.Sid) {
+      try { $owner = ([System.Security.Principal.SecurityIdentifier]$root.Sid).Translate([System.Security.Principal.NTAccount]).Value } catch { $owner = $root.Sid }
+    }
+    Get-ChildItem $root.Path -ErrorAction SilentlyContinue | ForEach-Object {
       $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
       if ($props -and $props.DisplayName) {
         [pscustomobject]@{
-          Computername = $env:COMPUTERNAME
-          Software     = $props.DisplayName
-          Version      = $props.DisplayVersion
-          Publisher    = $props.Publisher
-          InstallDate  = $props.InstallDate
-          Architecture = $arch
+          Computername    = $env:COMPUTERNAME
+          Software        = $props.DisplayName
+          Version         = $props.DisplayVersion
+          Publisher       = $props.Publisher
+          InstallDate     = $props.InstallDate
+          Architecture    = $root.Arch
+          Scope           = $root.Scope
+          User            = $owner
+          InstallLocation = $props.InstallLocation
+          Hidden          = [bool]($props.SystemComponent -eq 1 -or $props.ParentKeyName)
         }
       }
     }
   }
+  $script:InstalledAppsCache = @($out | Sort-Object Software, Version)
+  return $script:InstalledAppsCache
 }

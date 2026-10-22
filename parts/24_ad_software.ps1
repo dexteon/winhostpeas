@@ -45,9 +45,8 @@ if ($null -ne $adcs.MappingValue -and $adcs.UpnMapping) {
 
 Start-Section 'INSTALLED SOFTWARE (baseline inventory)'
 try {
+  # The installed-program count and full list are in the INVENTORY section.
   $apps = @(Get-InstalledApplications)
-  Add-Finding -Severity Info -Category 'Software' -Title ('{0} installed applications recorded' -f $apps.Count) `
-    -Detail 'Full inventory in reports; diff against build baseline to catch unauthorized software.'
   # flag ancient/unmaintained common-risk software by name
   $riskyNames = @('VNC', 'Telnet', 'WinSCP', 'FileZilla', 'uTorrent', 'TeamViewer')
   foreach ($r in $riskyNames) {
