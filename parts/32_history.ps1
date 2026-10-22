@@ -69,17 +69,51 @@ try {
 } catch { }
 
 # 2) Saved WiFi profiles (SSIDs remembered, incl. hidden corporate SSIDs)
+# The "All User Profile" label is localized, so the parse is positional: netsh prints two
+# dashed header separators (group-policy profiles, then user profiles) and every profile
+# line after the second one is four spaces, a label, " : " and the SSID. Lines without a
+# colon (for example "<None>") are skipped. When the WLAN service is absent there is no
+# separator at all, which is reported as "no wireless interface", not as "no profiles".
 try {
-  $wlanOutput = netsh wlan show profiles 2>$null
-  $ssids = @($wlanOutput | Where-Object { $_ -match 'All User Profile\s*:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
+  $ssids = @()
+  $wlanOutput = @(netsh wlan show profiles 2>$null)
+  $separators = 0
+  foreach ($line in $wlanOutput) {
+    if ($line -match '^-{5,}\s*$') { $separators++; continue }
+    if ($separators -ge 2 -and $line -match '^\s{4}\S.*?\s:\s(.+)$') {
+      $name = $Matches[1].Trim()
+      if ($name) { $ssids += $name }
+    }
+  }
+  # Fallback: the profile XML files (readable only elevated; the <name> element is not localized).
+  if ($ssids.Count -eq 0) {
+    try {
+      $xmls = @(Get-ChildItem "$env:ProgramData\Microsoft\Wlansvc\Profiles\Interfaces" -Filter '*.xml' -Recurse -ErrorAction SilentlyContinue)
+      foreach ($x in $xmls) {
+        try {
+          [xml]$doc = Get-Content -LiteralPath $x.FullName -Raw -ErrorAction Stop
+          $n = $doc.WLANProfile.name
+          if ($n) { $ssids += "$n".Trim() }
+        } catch { }
+      }
+    } catch { }
+  }
+  $ssids = @($ssids | Sort-Object -Unique)
   if ($ssids.Count -gt 0) {
     Add-Finding -Severity Info -Category 'History' -Title ('{0} saved WiFi profiles' -f $ssids.Count) `
       -Detail ($ssids -join ' | ') `
       -Remediation 'Saved profiles travel with the image; remove non-operational SSIDs before deployment (each is a location/oracle hint).'
-  } else {
-    Add-Finding -Severity Info -Category 'History' -Title 'No saved WiFi profiles (or no WLAN service)'
   }
-} catch { }
+  elseif ($separators -lt 2) {
+    Add-Finding -Severity Info -Category 'History' -Title 'WiFi profiles not assessed (no wireless interface or WLAN service)' `
+      -Detail 'netsh wlan show profiles produced no profile table on this host.'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'History' -Title 'No saved WiFi profiles'
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'History' -Title 'WiFi profiles not assessed' -Detail ('netsh wlan failed: ' + $_.Exception.Message)
+}
 
 # 3) DNS resolver cache - hosts recently resolved (who it has been talking to)
 try {
