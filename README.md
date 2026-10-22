@@ -206,3 +206,9 @@ Two notes for contributors. The assembly order in `build.ps1` is an explicit lis
 ## Legal
 
 For use only on systems you own or are explicitly authorized to audit. Derived from PEASS-ng's winPEAS (https://github.com/peass-ng/PEASS-ng, (c) PEASS-ng / @RandolphConley); defensive modifications only.
+
+## License
+
+GNU General Public License v2 or later, with PEASS-ng's clarifications, because WinHostPEAS is a derived work of PEASS-ng. See [LICENSE](LICENSE).
+
+You are free to use, modify and share WinHostPEAS. If you redistribute it or a modified version, keep the copyright notices and the credit (WinHostPEAS by Teon Moore / [CyberAutomations](https://cyberautomations.com), based on PEASS-ng), and make your source available under the same license.
