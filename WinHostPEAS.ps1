@@ -263,49 +263,55 @@ render();
   }
 }
 
+$script:LowPrivSids = @{
+  'S-1-1-0'      = 'Everyone'
+  'S-1-5-32-545' = 'BUILTIN\Users'
+  'S-1-5-11'     = 'Authenticated Users'
+  'S-1-5-4'      = 'INTERACTIVE'
+  'S-1-5-2'      = 'NETWORK'
+  'S-1-5-7'      = 'ANONYMOUS LOGON'
+  'S-1-5-32-546' = 'BUILTIN\Guests'
+  'S-1-5-13'     = 'Terminal Server Users'
+}
+
+try {
+  $script:AclCurrent = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $isElevated = ([Security.Principal.WindowsPrincipal]$script:AclCurrent).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $isElevated) { $script:LowPrivSids[$script:AclCurrent.User.Value] = $script:AclCurrent.Name }
+} catch { }
+
+$script:WriteRightsRx = 'FullControl|Modify|Write|CreateFiles|AppendData|ChangePermissions|TakeOwnership|SetValue|CreateSubKey'
+
+function Get-LowPrivWriteAce {
+  param($ACLObject)
+  foreach ($ace in $ACLObject.Access) {
+    if ($ace.AccessControlType -ne 'Allow') { continue }
+    if ("$($ace.PropagationFlags)" -match 'InheritOnly') { continue }
+    $sid = $null
+    try { $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+    if (-not $script:LowPrivSids.ContainsKey($sid)) { continue }
+    $rights = "$($ace.FileSystemRights)$($ace.RegistryRights)"
+    if ($rights -notmatch $script:WriteRightsRx) { continue }
+    $level = if ($rights -match 'FullControl') { 'FullControl' } elseif ($rights -match 'Modify') { 'Modify' }
+             elseif ($rights -match 'ChangePermissions|TakeOwnership') { 'ChangePermissions/TakeOwnership' } else { 'Write' }
+    return [pscustomobject]@{ Name = $script:LowPrivSids[$sid]; Sid = $sid; Level = $level; Rights = $rights }
+  }
+  return $null
+}
+
 function Start-ACLCheck {
   param($Target, $ServiceName)
   if ($null -eq $Target) { return }
   try { $ACLObject = Get-Acl $Target -ErrorAction SilentlyContinue } catch { return }
   if (-not $ACLObject) { return }
-  $Identity = @("$env:COMPUTERNAME\$env:USERNAME")
-  try {
-    whoami.exe /groups /fo csv 2>$null | Select-Object -skip 2 | ConvertFrom-Csv -Header 'group name' |
-      Select-Object -ExpandProperty 'group name' | ForEach-Object { $Identity += $_ }
-  } catch { }
-  $everyoneLike = @('Everyone', 'BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'BUILTIN\Authenticated Users')
-  foreach ($i in $Identity) {
-    $permission = $ACLObject.Access | Where-Object { $_.IdentityReference -like $i }
-
-    $fsr = "$($permission.FileSystemRights)"
-    $rr = "$($permission.RegistryRights)"
-    $userPermission = ''
-    if ($fsr -match 'FullControl') { $userPermission = 'FullControl' }
-    elseif ($fsr -match 'Modify') { $userPermission = 'Modify' }
-    elseif ($fsr -match 'Write') { $userPermission = 'Write' }
-    if ($rr -match 'FullControl') { $userPermission = 'FullControl' }
-    if ($userPermission) {
-      if ($Target -like "*$env:USERNAME*") { continue }
-      Add-Finding -Severity High -Category 'Filesystem ACL' `
-        -Title ("Non-admin identity has '{0}' on: {1}" -f $userPermission, $Target) `
-        -Detail ("Identity: {0}{1} - an attacker landing as this user could tamper with this object." -f $permission.IdentityReference, $(if ($ServiceName) { ' (service: ' + $ServiceName + ')' } else { '' })) `
-        -Evidence $Target `
-        -Remediation 'Tighten the ACL: remove broad write/modify for non-admin principals on executable paths and service binaries.'
-      return
-    }
-  }
-  foreach ($ev in $everyoneLike) {
-    $perm = $ACLObject.Access | Where-Object { $_.IdentityReference -like "*$ev*" -and $_.AccessControlType -eq 'Allow' }
-    foreach ($p in $perm) {
-      if ("$($p.FileSystemRights)" -match 'FullControl|Modify|Write') {
-        Add-Finding -Severity High -Category 'Filesystem ACL' `
-          -Title ("'{0}' granted {1} to: {2}" -f $ev, $p.FileSystemRights, $Target) `
-          -Evidence $Target `
-          -Remediation 'Restrict this permission to the service account / administrators that need it.'
-        return
-      }
-    }
-  }
+  $hit = Get-LowPrivWriteAce -ACLObject $ACLObject
+  if (-not $hit) { return }
+  if ($Target -like "$env:USERPROFILE*" -and $hit.Sid -eq $script:AclCurrent.User.Value) { return }
+  Add-Finding -Severity High -Category 'Filesystem ACL' `
+    -Title ("Low-privilege '{0}' has {1} on: {2}" -f $hit.Name, $hit.Level, $Target) `
+    -Detail ("{0} ({1}) can {2} this object{3}. Any process running as that principal could replace or alter it and gain the privileges of whatever runs it." -f $hit.Name, $hit.Sid, $hit.Level.ToLower(), $(if ($ServiceName) { ' (service: ' + $ServiceName + ')' } else { '' })) `
+    -Evidence $Target `
+    -Remediation 'Remove write, modify and full control for non-admin principals on executable paths, service binaries and their folders; keep them to Administrators, SYSTEM and TrustedInstaller.'
 }
 
 function Get-InstalledApplications {
