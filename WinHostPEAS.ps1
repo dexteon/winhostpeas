@@ -1060,8 +1060,16 @@ try {
 
 Start-Section 'LOCAL ACCOUNT HYGIENE'
 try {
-  $minLen = (net accounts | Select-String 'minimum password length').ToString()
-  $val = [int]($minLen -replace '[^\d]', '')
+
+  $na = @(net accounts 2>$null)
+  $minLen = $na | Where-Object { $_ -match 'minimum password length' } | Select-Object -First 1
+  if (-not $minLen) {
+    $kv = @($na | Where-Object { $_ -match ':\s*\S' })
+    if ($kv.Count -ge 4) { $minLen = $kv[3] }
+  }
+  if (-not $minLen) { throw 'net accounts returned no password policy' }
+  $digits = ($minLen -split ':', 2)[1] -replace '[^\d]', ''
+  $val = if ($digits) { [int]$digits } else { 0 }
   if ($val -lt 12) {
     Add-Finding -Severity Medium -Category 'Accounts' -Title ("Minimum password length only {0}" -f $val) `
       -Remediation 'Raise minimum length to 14+ and pair with banned-password lists.'
