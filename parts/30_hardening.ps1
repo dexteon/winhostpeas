@@ -8,31 +8,63 @@
 Start-Section 'PERSISTENCE DEEP-DIVE'
 
 # --- Winlogon hijack points ---
+# Shell and Userinit are compared token by token after trimming and expanding %SystemRoot%:
+# a substring match let "explorer.exe,evil.exe" and "userinit.exe,C:\evil.exe" pass, which is
+# exactly how the technique is used. Every extra token is hashed when it points at a file.
 $wlg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
 if ($wlg) {
-  foreach ($val in @('Shell', 'Userinit', 'Taskman', 'System', 'VmApplet', 'AppSetup')) {
-    $v = $wlg.$val
-    if ($null -eq $v) { continue }
-    $expected = @{ Shell = 'explorer.exe'; Userinit = 'C:\Windows\system32\userinit.exe,' }
-    if ($expected.ContainsKey($val)) {
-      if ($v -notlike "*$($expected[$val])*") {
-        Add-Finding -Severity Critical -Category 'Persistence' -Title ("Winlogon {0} hijacked: {1}" -f $val, $v) `
-          -Detail 'Executed at every logon as SYSTEM - classic Kovter-class persistence.' `
-          -Remediation "Restore ${val} to its Windows default immediately; trace what installed it."
+  try {
+    $sysRoot = "$env:SystemRoot"
+    $expectedTokens = @{
+      Shell    = @('explorer.exe')
+      Userinit = @((Join-Path $sysRoot 'system32\userinit.exe'))
+    }
+    # Values that are absent on a clean build, or have one known default (VmApplet is set by
+    # Windows itself; reporting it was a false positive on every host).
+    $knownDefaults = @{ VmApplet = @('SystemPropertiesPerformance.exe /pagefile', 'rundll32 shell32,Control_RunDLL "sysdm.cpl"') }
+    foreach ($val in @('Shell', 'Userinit', 'Taskman', 'System', 'VmApplet', 'AppSetup')) {
+      $v = $wlg.$val
+      if ($null -eq $v) { continue }
+      $raw = "$v"
+      if ($knownDefaults.ContainsKey($val) -and ($knownDefaults[$val] | Where-Object { $raw.Trim() -ieq $_ })) { continue }
+      if ($expectedTokens.ContainsKey($val)) {
+        $tokens = @($raw -split ',' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')) } | Where-Object { $_ })
+        $extra = @()
+        foreach ($t in $tokens) {
+          $match = $false
+          foreach ($e in $expectedTokens[$val]) { if ($t -ieq $e) { $match = $true } }
+          # Shell may legitimately be "explorer.exe" only; Userinit must be the single System32 path.
+          if (-not $match) { $extra += $t }
+        }
+        if ($extra.Count -gt 0 -or $tokens.Count -eq 0) {
+          $hashes = @()
+          foreach ($x in $extra) {
+            $exe = ($x -split '\s+')[0]
+            try { if ($exe -and (Test-Path -LiteralPath $exe -PathType Leaf)) { $hashes += ('{0} SHA256={1}' -f $exe, (Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop).Hash) } } catch { }
+          }
+          Add-Finding -Severity Critical -Category 'Persistence' -Title ("Winlogon {0} hijacked: {1}" -f $val, $raw) `
+            -Detail ('Expected exactly "{0}"; extra token(s): {1}. Executed at every logon - classic Kovter-class persistence.{2}' -f ($expectedTokens[$val] -join ','), ($extra -join ' | '), $(if ($hashes) { ' ' + ($hashes -join '; ') } else { '' })) `
+            -Evidence ("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon::{0} = {1}" -f $val, $raw) `
+            -Remediation "Restore ${val} to its Windows default immediately; trace what installed it."
+        }
+      }
+      elseif ($raw.Trim()) {
+        Add-Finding -Severity Medium -Category 'Persistence' -Title ("Winlogon '{0}' configured: {1}" -f $val, $raw) `
+          -Remediation 'Verify this value against a clean image; non-default Winlogon values execute at logon.'
       }
     }
-    elseif ($v) {
-      Add-Finding -Severity Medium -Category 'Persistence' -Title ("Winlogon '{0}' configured: {1}" -f $val, $v) `
-        -Remediation 'Verify this value against a clean image; non-default Winlogon values execute at logon.'
-    }
-  }
+  } catch { }
 }
 
 # --- WMI permanent event subscriptions (fileless persistence) ---
+# root\subscription is readable by standard users, so the result is reported either way;
+# "not assessed" is only emitted when the enumeration itself failed.
 try {
   $subs = @()
+  $wmiErr = $null
   foreach ($nsName in @('root\subscription', "root\cimv2")) {
-    $filter = Get-CimInstance -Namespace $nsName -ClassName __EventFilter -ErrorAction SilentlyContinue
+    $filter = $null
+    try { $filter = Get-CimInstance -Namespace $nsName -ClassName __EventFilter -ErrorAction Stop } catch { if ($nsName -eq 'root\subscription') { $wmiErr = $_.Exception.Message } }
     $binding = Get-CimInstance -Namespace $nsName -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue
     $consumer = @()
     $consumer += Get-CimInstance -Namespace $nsName -ClassName ActiveScriptEventConsumer -ErrorAction SilentlyContinue
@@ -57,32 +89,61 @@ try {
         -Remediation 'Permanent WMI subscriptions survive reboots and run as SYSTEM. Baseline a clean image; anything not from your build = remove + investigate.'
     }
   }
-  elseif ($script:IsElevated) {
-    Add-Finding -Severity Info -Category 'Persistence' -Title 'No WMI permanent event consumers'
+  elseif ($wmiErr) {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'WMI event subscriptions not assessed' `
+      -Detail ('Enumerating root\subscription failed: ' + $wmiErr + '. Run elevated if this was access denied.')
   }
   else {
-    Add-Finding -Severity Info -Category 'Persistence' -Title 'WMI event subscriptions not assessed (needs elevation)' `
-      -Detail 'Enumerating root\subscription requires administrator; run elevated to detect WMI-based fileless persistence.'
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'No WMI permanent event consumers'
   }
 } catch { }
 
 # --- COM hijack-prone: HKCU CLSID (per-user COM overrides) ---
 try {
+  # Per-user CLSIDs are normal on a desktop (PowerToys, Teams, OneDrive, browsers register under
+  # %LOCALAPPDATA%), so the count is Info. High only for a DLL that is unsigned, not validly
+  # signed, missing, or sitting in Temp, Public, Downloads or ProgramData; Low for a validly
+  # signed vendor DLL under LocalAppData.
   $hkcuClsid = Get-ChildItem 'HKCU:\Software\Classes\CLSID' -ErrorAction SilentlyContinue
   $count = @($hkcuClsid).Count
   if ($count -gt 0) {
-    Add-Finding -Severity Medium -Category 'Persistence' -Title ("{0} per-user CLSID overrides in HKCU (COM hijack surface)" -f $count) `
-      -Detail 'HKCU\Software\Classes\CLSID overrides HKLM COM registrations - a silent code-exec persistence slot invisible to per-machine audits.' `
-      -Remediation 'Compare against a clean profile; watch InprocServer32/LocalServer32 default values pointing outside Windows/Program Files.'
-    $suspicious = 0
-    foreach ($k in ($hkcuClsid | Select-Object -First 300)) {
+    $highHits = @(); $lowCount = 0; $lowSample = @(); $sysCount = 0
+    foreach ($k in ($hkcuClsid | Select-Object -First 500)) {
       $ips = Get-ItemProperty "$($k.PSPath)\InprocServer32" -ErrorAction SilentlyContinue
-      if ($ips -and $ips.'(default)' -and "$($ips.'(default)')" -notmatch '^C:\\(Windows|Program Files)' -and $suspicious -lt 5) {
-        Add-Finding -Severity High -Category 'Persistence' -Title ("HKCU COM server outside standard paths: {0}" -f $k.PSChildName) `
-          -Detail ("DLL: {0}" -f $ips.'(default)') `
-          -Remediation 'Verify; per-user COM DLLs loading from user-writable paths are hijack/persistence primitives.'
-        $suspicious++
+      if (-not $ips -or -not $ips.'(default)') { continue }
+      $dll = [Environment]::ExpandEnvironmentVariables(("$($ips.'(default)')").Trim().Trim('"'))
+      if ($dll -match '^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\))\\') { $sysCount++; continue }
+      $sig = $null; $hash = ''; $exists = $false
+      try {
+        if ($dll -and (Test-Path -LiteralPath $dll -PathType Leaf)) {
+          $exists = $true
+          $sig = (Get-AuthenticodeSignature -LiteralPath $dll -ErrorAction Stop).Status
+          $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+      } catch { }
+      $badPath = $dll -match '(?i)\\(Temp|Public|Downloads|ProgramData)\\'
+      $desc = ('{0} -> {1} [exists={2}; signature={3}{4}]' -f $k.PSChildName, $dll, $exists, $(if ($null -eq $sig) { 'n/a' } else { $sig }), $(if ($hash) { '; SHA256=' + $hash } else { '' }))
+      if ($badPath -or -not $exists -or "$sig" -ne 'Valid') {
+        $highHits += $desc
       }
+      else {
+        $lowCount++
+        if ($lowSample.Count -lt 5) { $lowSample += $desc }
+      }
+    }
+    Add-Finding -Severity Info -Category 'Persistence' -Title ("{0} per-user CLSID overrides in HKCU (COM hijack surface)" -f $count) `
+      -Detail ("InprocServer32 targets: {0} under Windows/Program Files, {1} validly signed elsewhere, {2} suspect. HKCU\Software\Classes\CLSID overrides HKLM COM registrations, a persistence slot invisible to per-machine audits." -f $sysCount, $lowCount, $highHits.Count) `
+      -Remediation 'Compare against a clean profile; watch InprocServer32/LocalServer32 default values pointing outside Windows/Program Files.'
+    foreach ($h in ($highHits | Select-Object -First 8)) {
+      Add-Finding -Severity High -Category 'Persistence' -Title ("HKCU COM server unsigned, missing or in a user-writable drop path") `
+        -Detail $h `
+        -Evidence ('HKCU:\Software\Classes\CLSID\' + ($h -split ' -> ')[0] + '\InprocServer32') `
+        -Remediation 'Verify the DLL; per-user COM DLLs that are unsigned or load from Temp/Public/Downloads/ProgramData are hijack and persistence primitives.'
+    }
+    if ($lowCount -gt 0) {
+      Add-Finding -Severity Low -Category 'Persistence' -Title ("{0} HKCU COM servers are validly signed DLLs outside Windows/Program Files" -f $lowCount) `
+        -Detail (($lowSample -join ' | ') + $(if ($lowCount -gt 5) { " | ... ($lowCount total)" } else { '' })) `
+        -Remediation 'Vendor DLLs under LocalAppData are normal (PowerToys, Teams, OneDrive, browsers); confirm the publisher matches an installed product.'
     }
   }
   else {
@@ -136,20 +197,37 @@ else {
 }
 
 # --- LSA security packages / notification packages (DLL load at boot) ---
-$lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
-foreach ($pkgName in @('Security Packages', 'Notification Packages')) {
-  $pkgs = $lsa.$pkgName
-  if ($pkgs) {
-    $expected = @{ 'Security Packages' = @('kerberos','msv1_0','schannel','wdigest','tspkg','pku2u','cloudap','ntlm'); 'Notification Packages' = @('scecli','rassfm','wdigest') }
-    $extra = @($pkgs | ForEach-Object { "$_" } | Where-Object { ($_.Trim('"', ' ', "`t") -ne '') } |
-      Where-Object { $expected[$pkgName] -notcontains $_.Trim().ToLower() })
+try {
+  $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+  $lsaOs = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig' -ErrorAction SilentlyContinue
+  $expected = @{
+    'Security Packages'       = @('kerberos', 'msv1_0', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'ntlm', 'negoexts', 'negotiate')
+    'Notification Packages'   = @('scecli', 'rassfm', 'wdigest')
+    'Authentication Packages' = @('msv1_0')   # T1547.002: the default is exactly msv1_0
+  }
+  $lsaSets = @(
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'Security Packages';       Obj = $lsa }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'Notification Packages';   Obj = $lsa }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'Authentication Packages'; Obj = $lsa }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig'; Name = 'Security Packages'; Obj = $lsaOs }
+  )
+  foreach ($ls in $lsaSets) {
+    if (-not $ls.Obj) { continue }
+    $pkgs = $ls.Obj.($ls.Name)
+    if ($null -eq $pkgs) { continue }
+    $entries = @($pkgs | ForEach-Object { "$_".Trim('"', ' ', "`t") } | Where-Object { $_ -ne '' })
+    $extra = @($entries | Where-Object { $expected[$ls.Name] -notcontains $_.ToLower() })
     if ($extra.Count -gt 0) {
-      Add-Finding -Severity Critical -Category 'Persistence' -Title ("Non-standard LSA {0}: {1}" -f $pkgName, ($extra -join ', ')) `
-        -Detail 'LSA packages load into LSASS at boot as SYSTEM - credential-capture territory (mimikatz uses this).' `
+      Add-Finding -Severity Critical -Category 'Persistence' -Title ("Non-standard LSA {0}: {1}" -f $ls.Name, ($extra -join ', ')) `
+        -Detail ("Full list: {0}. LSA packages load into LSASS at boot as SYSTEM - credential-capture territory (mimikatz misc::memssp, T1547.002)." -f ($entries -join ', ')) `
+        -Evidence ("{0}::{1}" -f $ls.Key, $ls.Name) `
         -Remediation 'Remove non-standard entries; verify the DLLs against the build baseline.'
     }
+    elseif ($ls.Name -eq 'Authentication Packages') {
+      Add-Finding -Severity Info -Category 'Persistence' -Title 'LSA Authentication Packages at default (msv1_0)'
+    }
   }
-}
+} catch { }
 
 # --- Active Setup (per-user exec at first logon) ---
 try {
@@ -184,13 +262,65 @@ try {
 } catch { }
 
 # --- Screensaver hijack (per-user, logon-session exec) ---
-foreach ($sidKey in @('HKCU:\Control Panel\Desktop')) {
-  $ss = Get-ItemProperty $sidKey -ErrorAction SilentlyContinue
-  if ($ss -and $ss.SCRNSAVE.EXE -and "$($ss.SCRNSAVE.EXE)" -notmatch '^C:\\Windows\\System32') {
-    Add-Finding -Severity Medium -Category 'Persistence' -Title ("Screensaver outside System32: {0}" -f $ss.'SCRNSAVE.EXE') `
-      -Remediation 'Screensaver path executes at idle timeout; user-writable .scr = persistence.'
+# The value name contains a dot, so it must be quoted: $ss.SCRNSAVE.EXE parses as
+# ($ss.SCRNSAVE).EXE, which is always null and made this check unable to fire.
+try {
+  foreach ($sidKey in @('HKCU:\Control Panel\Desktop')) {
+    $ss = Get-ItemProperty $sidKey -ErrorAction SilentlyContinue
+    $scr = if ($ss) { "$($ss.'SCRNSAVE.EXE')".Trim() } else { '' }
+    if ($scr) {
+      $scrPath = [Environment]::ExpandEnvironmentVariables($scr.Trim('"'))
+      $sysDir = Join-Path "$env:SystemRoot" 'System32'
+      if ($scrPath -notmatch '^[A-Za-z]:\\' ) { $scrPath = Join-Path $sysDir $scrPath }   # bare name resolves from System32
+      if ($scrPath -notlike "$sysDir\*") {
+        $h = ''
+        try { if (Test-Path -LiteralPath $scrPath -PathType Leaf) { $h = ' SHA256=' + (Get-FileHash -LiteralPath $scrPath -Algorithm SHA256 -ErrorAction Stop).Hash } } catch { }
+        Add-Finding -Severity Medium -Category 'Persistence' -Title ("Screensaver outside System32: {0}" -f $scr) `
+          -Detail ("Resolved path: {0}{1}" -f $scrPath, $h) `
+          -Evidence "$sidKey::SCRNSAVE.EXE" `
+          -Remediation 'Screensaver path executes at idle timeout; user-writable .scr = persistence (T1546.002).'
+      }
+    }
   }
-}
+} catch { }
+
+# --- AppCertDlls (loaded into every process that calls CreateProcess, T1546.009) ---
+try {
+  $appCert = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls' -ErrorAction SilentlyContinue
+  if ($appCert -and @($appCert.Property).Count -gt 0) {
+    $vals = @($appCert.Property | ForEach-Object { '{0} = {1}' -f $_, (Get-ItemProperty $appCert.PSPath -Name $_ -ErrorAction SilentlyContinue).$_ })
+    Add-Finding -Severity High -Category 'Persistence' -Title ("AppCertDlls configured ({0} value(s))" -f $vals.Count) `
+      -Detail (($vals -join ' | ') + '. Each DLL is loaded by every process that calls CreateProcess, CreateProcessAsUser, WinExec and friends.') `
+      -Evidence 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls' `
+      -Remediation 'The key is empty on a clean build. Identify the DLL, treat it as malicious until proven otherwise, and remove the value.'
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'AppCertDlls key absent or empty (clean)'
+  }
+} catch { }
+
+# --- Hidden logon accounts (SpecialAccounts\UserList, T1564.002) ---
+try {
+  $ul = Get-Item 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' -ErrorAction SilentlyContinue
+  $hidden = @()
+  if ($ul) {
+    foreach ($n in @($ul.Property)) {
+      $v = (Get-ItemProperty $ul.PSPath -Name $n -ErrorAction SilentlyContinue).$n
+      if ($v -eq 0) { $hidden += $n }
+    }
+  }
+  if ($hidden.Count -gt 0) {
+    foreach ($hname in $hidden) {
+      Add-Finding -Severity High -Category 'Persistence' -Title ("Account hidden from the logon screen: {0}" -f $hname) `
+        -Detail 'A UserList value of 0 hides the account from the Welcome screen and user switching; classic backdoor-account concealment.' `
+        -Evidence ("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList::{0} = 0" -f $hname) `
+        -Remediation 'Confirm the account is authorized; remove the UserList value and investigate who created the account.'
+    }
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Persistence' -Title 'No accounts hidden via SpecialAccounts\UserList'
+  }
+} catch { }
 
 ######################## IMAGE HARDENING BASELINE ########################
 # The switch-to-flip list: what the golden image should enforce. Each check
@@ -303,45 +433,97 @@ try {
   }
 } catch { }
 
-# --- AppLocker / WDAC policy presence ---
-$appLockerSvc = Get-Service AppIDSvc -ErrorAction SilentlyContinue
-$alRules = 0
+# --- Application control: WDAC (user-mode code integrity), Smart App Control, AppLocker ---
+# Real state, not key counts: Win32_DeviceGuard reports UMCI enforcement (0 off, 1 audit,
+# 2 enforced) and kernel CI; CI\Policy VerifiedAndReputablePolicyState is Smart App Control
+# (0 off, 1 on, 2 evaluation); Get-AppLockerPolicy -Effective is the merged AppLocker policy.
+# High only when all three are off. Kernel-mode CI enforced (the HVCI default policy) is NOT
+# application control, so it is reported as detail only.
 try {
-  foreach ($coll in @('Exe','Dll','Script','Msi','Packaged app')) {
-    $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2\$coll"
-    if (Test-Path $path) { $alRules += @(Get-ChildItem $path).Count }
+  $umci = $null; $kmci = $null
+  try {
+    $dgAc = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop | Select-Object -First 1
+    if ($dgAc) { $umci = [int]$dgAc.UsermodeCodeIntegrityPolicyEnforcementStatus; $kmci = [int]$dgAc.CodeIntegrityPolicyEnforcementStatus }
+  } catch { }
+  $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+  $ciLabel = @{ 0 = 'off'; 1 = 'audit'; 2 = 'enforced' }
+  $sacLabel = @{ 0 = 'off'; 1 = 'on'; 2 = 'evaluation' }
+  $alRules = 0; $alCollections = @(); $alEffectiveRead = $false
+  try {
+    $alp = Get-AppLockerPolicy -Effective -ErrorAction Stop
+    $alEffectiveRead = $true
+    foreach ($rc in @($alp.RuleCollections)) {
+      $n = @($rc).Count
+      if ($n -gt 0) { $alRules += $n; $alCollections += ('{0}:{1} rules ({2})' -f $rc.RuleCollectionType, $n, $rc.EnforcementMode) }
+    }
+  } catch { }
+  if (-not $alEffectiveRead) {
+    # Fallback: policy registry key counts (the previous method).
+    foreach ($coll in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
+      $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2\$coll"
+      if (Test-Path $path) { $c = @(Get-ChildItem $path -ErrorAction SilentlyContinue).Count; if ($c -gt 0) { $alRules += $c; $alCollections += "${coll}:$c rules (registry)" } }
+    }
   }
-} catch { }
-$wdac = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue
-if ($alRules -gt 0) {
-  Add-Finding -Severity Info -Category 'Hardening' -Title ("AppLocker: {0} rules configured" -f $alRules)
-  if ($appLockerSvc -and $appLockerSvc.Status -ne 'Running') {
-    Add-Finding -Severity Medium -Category 'Hardening' -Title 'AppLocker rules exist but AppIDSvc not running' `
-      -Remediation 'Set AppIDSvc to auto-start; rules without the service are inert.'
-  }
-}
-elseif ($wdac) {
-  Add-Finding -Severity Info -Category 'Hardening' -Title 'WDAC policy present (code integrity)'
-}
-else {
-  Add-Finding -Severity High -Category 'Hardening' -Title 'No AppLocker or WDAC application-control policy' `
-    -Detail 'Everything this report lists as persistence/privexec runs because nothing blocks unsigned execution.' `
-    -Remediation 'Golden-image item: deploy WDAC (audit -> enforce) or AppLocker baseline rules (EXE/DLL/Script/MSI). Single highest-value hardening control.'
-}
-
-# --- SmartScreen ---
-try {
-  $ss = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name SmartScreenEnabled -ErrorAction SilentlyContinue
-  $ssVal = "$($ss.SmartScreenEnabled)"
-  if ($ssVal -eq 'Off') {
-    Add-Finding -Severity Medium -Category 'Hardening' -Title 'SmartScreen OFF (machine)' `
-      -Remediation 'Set SmartScreenEnabled=Warn/Block.'
-  }
-  elseif ($ssVal) {
-    Add-Finding -Severity Info -Category 'Hardening' -Title "SmartScreen: $ssVal"
+  $appLockerSvc = Get-Service AppIDSvc -ErrorAction SilentlyContinue
+  $umciOn = ($null -ne $umci -and $umci -ge 1)
+  $sacOn = ($sac -eq 1 -or $sac -eq 2)
+  $alOn = ($alRules -gt 0)
+  $stateDetail = ("WDAC user-mode CI: {0}; kernel-mode CI: {1}; Smart App Control: {2}; AppLocker: {3}" -f `
+    $(if ($null -eq $umci) { 'not readable' } elseif ($ciLabel.ContainsKey($umci)) { $ciLabel[$umci] } else { $umci }), `
+    $(if ($null -eq $kmci) { 'not readable' } elseif ($ciLabel.ContainsKey($kmci)) { $ciLabel[$kmci] } else { $kmci }), `
+    $(if ($null -eq $sac) { 'absent (off)' } elseif ($sacLabel.ContainsKey([int]$sac)) { $sacLabel[[int]$sac] } else { $sac }), `
+    $(if ($alOn) { $alCollections -join ', ' } elseif ($alEffectiveRead) { 'no effective rules' } else { 'not readable' }))
+  if ($umciOn -or $sacOn -or $alOn) {
+    $sev = 'Info'; $mode = @()
+    if ($umciOn) { $mode += ('WDAC ' + $ciLabel[$umci]) ; if ($umci -eq 1) { $sev = 'Low' } }
+    if ($sacOn)  { $mode += ('Smart App Control ' + $sacLabel[[int]$sac]); if ($sac -eq 2) { $sev = 'Low' } }
+    if ($alOn)   { $mode += 'AppLocker' }
+    Add-Finding -Severity $sev -Category 'Hardening' -Title ("Application control present: {0}" -f ($mode -join ' + ')) `
+      -Detail ($stateDetail + $(if ($sev -eq 'Low') { '. Audit/evaluation mode logs but does not block.' } else { '' })) `
+      -Remediation $(if ($sev -eq 'Low') { 'Promote audit/evaluation to enforced once the allow list is validated.' } else { '' })
+    if ($alOn -and $appLockerSvc -and $appLockerSvc.Status -ne 'Running') {
+      Add-Finding -Severity Medium -Category 'Hardening' -Title 'AppLocker rules exist but AppIDSvc not running' `
+        -Detail ($alCollections -join ', ') `
+        -Remediation 'Set AppIDSvc to auto-start; rules without the service are inert.'
+    }
   }
   else {
-    Add-Finding -Severity Info -Category 'Hardening' -Title 'SmartScreen key not set (modern builds use per-app policies - verify via Windows Security UI)'
+    Add-Finding -Severity High -Category 'Hardening' -Title 'No application control (WDAC user-mode, Smart App Control and AppLocker all off)' `
+      -Detail ($stateDetail + '. Everything this report lists as persistence/privexec runs because nothing blocks unsigned execution.') `
+      -Remediation 'Golden-image item: deploy WDAC (audit -> enforce) or AppLocker baseline rules (EXE/DLL/Script/MSI); on unmanaged Win11, Smart App Control. Single highest-value hardening control.'
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'Hardening' -Title 'Application control state not assessed' -Detail ('Read failed: ' + $_.Exception.Message)
+}
+
+# --- SmartScreen (policy first, Explorer value as fallback) ---
+try {
+  $ssPol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue
+  $polEnable = if ($ssPol) { $ssPol.EnableSmartScreen } else { $null }
+  $polLevel = if ($ssPol) { "$($ssPol.ShellSmartScreenLevel)" } else { '' }
+  $ss = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name SmartScreenEnabled -ErrorAction SilentlyContinue
+  $ssVal = "$($ss.SmartScreenEnabled)"
+  if ($polEnable -eq 0) {
+    Add-Finding -Severity Medium -Category 'Hardening' -Title 'SmartScreen disabled by policy (EnableSmartScreen=0)' `
+      -Evidence 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System::EnableSmartScreen' `
+      -Remediation 'Set "Configure Windows Defender SmartScreen" to Enabled with "Warn and prevent bypass" (CIS 18.10.76.2.1).'
+  }
+  elseif ($polEnable -eq 1) {
+    $sev = if ($polLevel -eq 'Block') { 'Info' } else { 'Low' }
+    Add-Finding -Severity $sev -Category 'Hardening' -Title ("SmartScreen enforced by policy (level: {0})" -f $(if ($polLevel) { $polLevel } else { 'not set = Warn' })) `
+      -Remediation $(if ($sev -eq 'Low') { 'Set ShellSmartScreenLevel=Block ("Warn and prevent bypass") so users cannot click through.' } else { '' })
+  }
+  elseif ($ssVal -eq 'Off') {
+    Add-Finding -Severity Medium -Category 'Hardening' -Title 'SmartScreen OFF (machine Explorer setting, no policy)' `
+      -Evidence 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer::SmartScreenEnabled' `
+      -Remediation 'Set SmartScreenEnabled=Warn/Block, or enforce it by policy (EnableSmartScreen=1, ShellSmartScreenLevel=Block).'
+  }
+  elseif ($ssVal) {
+    Add-Finding -Severity Info -Category 'Hardening' -Title "SmartScreen: $ssVal (Explorer setting, not enforced by policy)"
+  }
+  else {
+    Add-Finding -Severity Info -Category 'Hardening' -Title 'SmartScreen not configured by policy or Explorer value (OS default Warn; user-changeable)' `
+      -Remediation 'Enforce by policy so users cannot turn it off (EnableSmartScreen=1, ShellSmartScreenLevel=Block).'
   }
 } catch { }
 
@@ -369,16 +551,8 @@ try {
   else { Add-Finding -Severity Info -Category 'Hardening' -Title 'Guest account disabled' }
 } catch { }
 
-# --- Remote desktop helpers image should remove ---
-foreach ($feature in @('TelnetClient', 'TFTPClient', 'MicrosoftWindowsPowerShellV2', 'SMB1Protocol')) {
-  try {
-    $f = Get-WindowsOptionalFeature -Online -FeatureName $feature -ErrorAction SilentlyContinue
-    if ($f -and $f.State -eq 'Enabled') {
-      Add-Finding -Severity High -Category 'Hardening' -Title ("Remove from image: feature {0} enabled" -f $feature) `
-        -Remediation "Disable-WindowsOptionalFeature -Online -FeatureName $feature"
-    }
-  } catch { }
-}
+# (Legacy optional features - Telnet, TFTP, PowerShell v2, SMB1 - are reported once, in the
+#  OS Vulnerability section, which also says "not assessed" when not elevated.)
 
 # --- Local admin RDP membership recap (image hygiene) ---
 try {
@@ -389,23 +563,39 @@ try {
 } catch { }
 
 # --- Null sessions / registry remote access ---
-foreach ($rk in @(
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymous'; Want = 1 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymousSAM'; Want = 1 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareWks'; Want = 0 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareServer'; Want = 0 },
-  @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry'; Name = 'Start'; Want = 4 }
-)) {
-  $v = (Get-ItemProperty $rk.Key -Name $rk.Name -ErrorAction SilentlyContinue).($rk.Name)
-  if ($null -ne $v -and [int]$v -ne [int]$rk.Want) {
-    Add-Finding -Severity Medium -Category 'Hardening' -Title ("{0} = {1} (hardening wants {2})" -f $rk.Name, $v, $rk.Want) `
-      -Remediation ("Set {0}={1} in the image (null-session / remote-registry hardening)." -f $rk.Name, $rk.Want)
-  }
-  elseif ($null -eq $v -and $rk.Name -match 'AutoShare') {
-    # defaults: Wks=1 on client SKUs
-    if ($rk.Name -eq 'AutoShareWks') {
-      Add-Finding -Severity Low -Category 'Hardening' -Title 'AutoShareWks not set (default shares C$/ADMIN$ enabled)' `
-        -Remediation 'Set AutoShareWks=0 in hardened images to kill default admin shares.'
+# An absent value means the OS default, and the default is evaluated: RestrictAnonymous
+# defaults to 0 (fails CIS 2.3.10.2), RestrictAnonymousSAM to 1, EveryoneIncludesAnonymous
+# to 0, AutoShare* to 1. RemoteRegistry Start defaults to 3 (Manual, trigger-started) on
+# client SKUs, which is Low; 2 (Automatic) is Medium; absent means the service is not installed.
+try {
+  $isClientSku = $true
+  try { $isClientSku = ([int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).ProductType -eq 1) } catch { }
+  $nullChecks = @(
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymous';         Want = 1; Default = 0; Sev = 'Medium'; Ref = 'CIS 2.3.10.2: anonymous enumeration of SAM accounts and shares' }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RestrictAnonymousSAM';      Want = 1; Default = 1; Sev = 'Medium'; Ref = 'CIS 2.3.10.1: anonymous enumeration of SAM accounts' }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'EveryoneIncludesAnonymous'; Want = 0; Default = 0; Sev = 'Medium'; Ref = 'CIS 2.3.10.4: Everyone permissions apply to anonymous users' }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareWks';    Want = 0; Default = 1; Sev = 'Low'; Ref = 'default admin shares C$/ADMIN$ (client SKU)'; OnlyClient = $true }
+    @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name = 'AutoShareServer'; Want = 0; Default = 1; Sev = 'Low'; Ref = 'default admin shares C$/ADMIN$ (server SKU)'; OnlyServer = $true }
+  )
+  foreach ($rk in $nullChecks) {
+    if ($rk.OnlyClient -and -not $isClientSku) { continue }
+    if ($rk.OnlyServer -and $isClientSku) { continue }
+    $v = (Get-ItemProperty $rk.Key -Name $rk.Name -ErrorAction SilentlyContinue).($rk.Name)
+    $eff = if ($null -eq $v) { [int]$rk.Default } else { [int]$v }
+    $src = if ($null -eq $v) { 'absent = OS default ' + $rk.Default } else { "$v" }
+    if ($eff -ne [int]$rk.Want) {
+      Add-Finding -Severity $rk.Sev -Category 'Hardening' -Title ("{0} = {1} (hardening wants {2})" -f $rk.Name, $src, $rk.Want) `
+        -Detail $rk.Ref `
+        -Evidence ("{0}::{1}" -f $rk.Key, $rk.Name) `
+        -Remediation ("Set {0}={1} in the image (null-session / default-share hardening)." -f $rk.Name, $rk.Want)
     }
   }
-}
+  $rrStart = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry' -Name Start -ErrorAction SilentlyContinue).Start
+  if ($null -ne $rrStart -and [int]$rrStart -ne 4) {
+    $rrSev = if ([int]$rrStart -eq 2) { 'Medium' } else { 'Low' }
+    Add-Finding -Severity $rrSev -Category 'Hardening' -Title ("RemoteRegistry service Start = {0} (hardening wants 4 = Disabled)" -f $rrStart) `
+      -Detail $(if ([int]$rrStart -eq 2) { 'Automatic start: remote registry reads/writes are available to any authenticated admin, and to attackers with a stolen admin credential.' } else { 'Manual (trigger-started) is the client default; it still starts on demand for remote registry access.' }) `
+      -Evidence 'HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry::Start' `
+      -Remediation 'Set the Remote Registry service to Disabled (CIS 5.x) unless a management tool needs it.'
+  }
+} catch { }

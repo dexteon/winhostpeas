@@ -24,14 +24,54 @@ else {
     -Remediation 'Enable RunAsPPL=1 via GPE: Computer Config > Admin Templates > System > Local Run As PPL.'
 }
 
-# Credential Guard
-$lsaCfg = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -ErrorAction SilentlyContinue).LsaCfgFlags
-if ($lsaCfg -eq 1 -or $lsaCfg -eq 2) {
-  Add-Finding -Severity Info -Category 'Credentials' -Title "Credential Guard enabled (LsaCfgFlags=$lsaCfg)"
-}
-else {
-  Add-Finding -Severity Medium -Category 'Credentials' -Title 'Credential Guard not enabled' `
-    -Remediation 'Enable Credential Guard (hardware virtualization) to harden LSASS against dump-and-reuse.'
+# Credential Guard: running state from Win32_DeviceGuard (SecurityServicesRunning contains 1).
+# LsaCfgFlags alone gives false negatives: CG is on by default on Win11 22H2+ Enterprise/
+# Education with no registry value, the policy value lives under Policies\...\DeviceGuard,
+# and "configured" is not "running".
+try {
+  $lsaCfg = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\LSA' -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags
+  $lsaCfgPol = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard' -Name LsaCfgFlags -ErrorAction SilentlyContinue).LsaCfgFlags
+  $cgDetail = ("Registry: Control\LSA LsaCfgFlags={0}; policy DeviceGuard LsaCfgFlags={1}" -f $(if ($null -eq $lsaCfg) { 'absent' } else { $lsaCfg }), $(if ($null -eq $lsaCfgPol) { 'absent' } else { $lsaCfgPol }))
+  $dg = $null
+  try { $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop | Select-Object -First 1 } catch { $dg = $null }
+  if ($dg) {
+    $cgRunning    = (@($dg.SecurityServicesRunning)    -contains 1)
+    $cgConfigured = (@($dg.SecurityServicesConfigured) -contains 1)
+    $vbsRunning   = ([int]$dg.VirtualizationBasedSecurityStatus -eq 2)
+    $vbsCapable   = (@($dg.AvailableSecurityProperties) -contains 2)
+    $osBuild = 0; try { $osBuild = [int](Get-CimInstance Win32_OperatingSystem).BuildNumber } catch { }
+    $cgDetail += ("; Win32_DeviceGuard: VBS status={0}, SecurityServicesConfigured={1}, SecurityServicesRunning={2}" -f $dg.VirtualizationBasedSecurityStatus, (@($dg.SecurityServicesConfigured) -join ','), (@($dg.SecurityServicesRunning) -join ','))
+    if ($cgRunning) {
+      Add-Finding -Severity Info -Category 'Credentials' -Title 'Credential Guard RUNNING' -Detail $cgDetail
+    }
+    elseif ($cgConfigured) {
+      Add-Finding -Severity Medium -Category 'Credentials' -Title 'Credential Guard configured but NOT running' `
+        -Detail ($cgDetail + '. Configured without running usually means a pending reboot, a missing VBS prerequisite (UEFI, Secure Boot, hypervisor), or the UEFI lock blocking a change.') `
+        -Remediation 'Reboot and re-check; verify VBS prerequisites with msinfo32 (Virtualization-based security: Running).'
+    }
+    elseif ($vbsCapable -and $osBuild -ge 22000) {
+      Add-Finding -Severity Medium -Category 'Credentials' -Title 'Credential Guard not running (hardware capable)' `
+        -Detail ($cgDetail + ("; VBS running={0}. LSASS secrets (NTLM hashes, Kerberos TGTs) are dumpable by any admin-level code." -f $vbsRunning)) `
+        -Remediation 'Enable Credential Guard (GPO: Turn On Virtualization Based Security > Credential Guard configuration = Enabled with UEFI lock, or Intune/MDM). Requires VBS; on Pro it needs explicit enablement.'
+    }
+    else {
+      Add-Finding -Severity Low -Category 'Credentials' -Title 'Credential Guard not running (platform not capable or pre-Win11 build)' `
+        -Detail ($cgDetail + ("; VBS capable={0}, build={1}." -f $vbsCapable, $osBuild)) `
+        -Remediation 'Credential Guard needs UEFI, Secure Boot, a hypervisor-capable CPU and a supported SKU; plan it into the next hardware/OS refresh.'
+    }
+  }
+  else {
+    if ($lsaCfg -eq 1 -or $lsaCfg -eq 2 -or $lsaCfgPol -eq 1 -or $lsaCfgPol -eq 2) {
+      Add-Finding -Severity Info -Category 'Credentials' -Title 'Credential Guard configured (running state not assessed: Win32_DeviceGuard unavailable)' -Detail $cgDetail
+    }
+    else {
+      Add-Finding -Severity Medium -Category 'Credentials' -Title 'Credential Guard not configured (running state not assessed: Win32_DeviceGuard unavailable)' `
+        -Detail ($cgDetail + '. The DeviceGuard CIM namespace was not readable, so only the registry configuration is known.') `
+        -Remediation 'Enable Credential Guard (hardware virtualization) to harden LSASS against dump-and-reuse.'
+    }
+  }
+} catch {
+  Add-Finding -Severity Info -Category 'Credentials' -Title 'Credential Guard not assessed' -Detail ('Read failed: ' + $_.Exception.Message)
 }
 
 # Cached logons
@@ -84,11 +124,22 @@ if (Test-Path 'HKCU:\SOFTWARE\SimonTatham\PuTTY\Sessions') {
     }
   }
 }
-# OpenSSH agent keys registered
+# OpenSSH agent keys registered. The key is ACLed to SYSTEM on current builds, so a read
+# failure is reported as "not assessed", never as 0 keys.
 if (Test-Path 'HKCU:\Software\OpenSSH\Agent\Keys') {
-  $n = (Get-Item 'HKCU:\Software\OpenSSH\Agent\Keys').Property.Count
-  Add-Finding -Severity Medium -Category 'Credentials' -Title "$n SSH key(s) registered in ssh-agent" `
-    -Remediation 'Verify these are authorized; ssh-agent keys are extractable by SYSTEM-level code.'
+  try {
+    $n = @((Get-Item 'HKCU:\Software\OpenSSH\Agent\Keys' -ErrorAction Stop).Property).Count
+    if ($n -gt 0) {
+      Add-Finding -Severity Medium -Category 'Credentials' -Title "$n SSH key(s) registered in ssh-agent" `
+        -Remediation 'Verify these are authorized; ssh-agent keys are extractable by SYSTEM-level code.'
+    }
+    else {
+      Add-Finding -Severity Info -Category 'Credentials' -Title 'No SSH keys registered in ssh-agent'
+    }
+  } catch {
+    Add-Finding -Severity Info -Category 'Credentials' -Title 'ssh-agent key store present but not readable (not assessed)' `
+      -Detail ('HKCU:\Software\OpenSSH\Agent\Keys exists; read failed: ' + $_.Exception.Message + '. The key is SYSTEM-only by design; inspect with ssh-add -l as the user.')
+  }
 }
 
 # DPAPI protect folders present (normal, informational)
@@ -113,15 +164,19 @@ foreach ($f in $script:SensitiveFileTargets) {
 }
 
 # Sticky notes database (plaintext credential risk)
-if (Test-Path "C:\Users\$env:USERNAME\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes*\LocalState\plum.sqlite") {
+if ($env:LOCALAPPDATA -and (Test-Path "$env:LOCALAPPDATA\Packages\Microsoft.MicrosoftStickyNotes*\LocalState\plum.sqlite")) {
   Add-Finding -Severity Medium -Category 'Credentials' -Title 'Sticky Notes database present' `
     -Detail 'Sticky Notes frequently contain passwords in plaintext (plum.sqlite).' `
     -Remediation 'Educate users; consider disabling Sticky Notes on sensitive hosts.'
 }
 
 # PowerShell history credential usage - REDACTED, current user only
-$histPath = (Get-PSReadLineOption).HistorySavePath
-if (Test-Path $histPath) {
+# Get-PSReadLineOption throws when PSReadLine is not loaded (scheduled / -File runs), so fall
+# back to the documented default history path instead of skipping the check.
+$histPath = $null
+try { $histPath = (Get-PSReadLineOption -ErrorAction Stop).HistorySavePath } catch { $histPath = $null }
+if (-not $histPath) { $histPath = Join-Path $env:APPDATA 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt' }
+if ($histPath -and (Test-Path $histPath)) {
   $histHits = @()
   try {
     $ln = 0

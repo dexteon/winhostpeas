@@ -70,21 +70,29 @@ The winPEAS regex corpus (cloud keys, GitHub/GitLab tokens, JWTs, private-key bl
 
 ### Credential exposure
 
-WDigest plaintext storage, LSA Protection (RunAsPPL), Credential Guard, cached logon count, AutoAdminLogon passwords (redacted), PuTTY stored proxy passwords, ssh-agent keys, unattend and sysprep answer files, cloud CLI credential files, SAM/SYSTEM hive copies.
+WDigest plaintext storage, LSA Protection (RunAsPPL), Credential Guard running state (from `Win32_DeviceGuard`, since it is on by default on newer Windows with no registry value), cached logon count, AutoAdminLogon passwords (redacted), PuTTY stored proxy passwords, ssh-agent keys, unattend and sysprep answer files, cloud CLI credential files, SAM/SYSTEM hive copies.
 
 ### Privilege escalation
 
 AlwaysInstallElevated, unquoted service paths, weak ACLs on service binaries and service registry keys, user-writable startup items, dangerous token privileges held by the caller (SeImpersonate, SeDebug, SeBackup), PointAndPrint policy, WSUS over HTTP, writable scheduled-task actions.
 
+Service DACLs are read with `sc.exe sdshow` and flagged when a low-privilege principal can change the service configuration, DACL or owner (Critical when the service runs as LocalSystem; start and stop rights alone are not escalation). Service binaries in user-writable folders or unsigned, svchost `ServiceDll` entries outside System32, writable machine `PATH` folders ahead of System32, writable Program Files subfolders and running process binaries are all checked by ACL.
+
+Every permission check works by SID against low-privilege principals (Everyone, Users, Authenticated Users, INTERACTIVE and similar, plus the running user only when not elevated), so results are the same in any Windows language and do not depend on who runs the audit. Deny and inherit-only entries are skipped.
+
 UAC coverage distinguishes *EnableLUA absent* from *EnableLUA = 0*, because a deleted value implies tampering and calls for different remediation. It also flags silent-elevation consent and `LocalAccountTokenFilterPolicy = 1`, the setting that makes pass-the-hash work against admin shares.
 
 ### Defender and AV posture
 
-Realtime status, signature freshness, scan recency, and a full exclusion inventory. Exclusions are the first thing an attacker adds. A standard user only sees a subset of them, so a non-elevated run labels the count PARTIAL instead of presenting it as complete.
+Realtime status, Tamper Protection, running mode (normal, passive or EDR block mode), signature freshness, scan recency, and a full exclusion inventory. Exclusions are the first thing an attacker adds. A standard user only sees a subset of them, so a non-elevated run labels the count PARTIAL instead of presenting it as complete.
 
 ### Logging and detection coverage
 
-auditpol subcategories, Security event log sizing, Windows Event Forwarding, and PowerShell ScriptBlock/Module/Transcription logging gaps. This is the telemetry an attacker hopes is missing.
+auditpol subcategories read by GUID (so the parse is not tied to an English display name), process-creation command-line capture, Security event log sizing, Windows Event Forwarding, and PowerShell ScriptBlock/Module/Transcription logging gaps. This is the telemetry an attacker hopes is missing.
+
+### Security features and detection coverage
+
+Third-party AV and EDR presence (Security Center plus a table of known EDR services), Microsoft Defender for Endpoint onboarding, VBS and HVCI (Memory Integrity) running state from `Win32_DeviceGuard`, Secure Boot, the Microsoft vulnerable driver blocklist, NTLM session security and restriction settings against CIS, the mDNS and WPAD legs of the Responder poisoning chain, Sysmon (by its filter altitude, so a renamed driver is still found) and log-forwarding agents. A host with no Sysmon, no EDR and no forwarding gets a single "host telemetry gap" finding.
 
 ### Network attack surface
 
@@ -120,11 +128,11 @@ Read-only inventory via `Microsoft.Web.Administration`: sites and bindings, app 
 
 ### OS and crypto surface
 
-Build and end-of-support status, SCHANNEL protocol inventory, enabled cipher-suite audit, FIPS status, SMB signing, .NET version and `SchUseStrongCrypto`, legacy optional features, secedit password and lockout baseline, RDP encryption level, and bcdedit testsigning and code-integrity state.
+Build and end-of-support status, SCHANNEL protocol inventory (absent registry keys resolved to the per-build Windows default, so TLS 1.0/1.1 count as on where Windows enables them), enabled cipher-suite audit, FIPS status, SMB signing, .NET version and `SchUseStrongCrypto`, legacy optional features, secedit password and lockout baseline, RDP encryption level, and bcdedit testsigning and code-integrity state.
 
 ### Persistence deep-dive
 
-The quieter slots beyond autoruns: Winlogon Shell/Userinit/Taskman hijacks, WMI permanent event subscriptions, per-user COM hijacks, IFEO Debuggers and SilentProcessExit monitors, AppInit_DLLs, non-standard LSA Security and Notification packages, Active Setup StubPaths, netsh helper DLLs, screensaver hijacks.
+The quieter slots beyond autoruns: Winlogon Shell/Userinit/Taskman hijacks, WMI permanent event subscriptions, per-user COM hijacks, IFEO Debuggers and SilentProcessExit monitors, AppInit_DLLs, non-standard LSA Security, Authentication and Notification packages, AppCertDlls, accounts hidden from the logon screen (`SpecialAccounts\UserList`), Active Setup StubPaths, netsh helper DLLs, screensaver hijacks. Winlogon values are compared token by token, not by substring.
 
 ### Advanced persistence and obfuscation
 
@@ -152,7 +160,7 @@ Suspect commands and DLLs surfaced by these checks carry a SHA-256 in the findin
 
 ### Image hardening baseline
 
-Every check reports current state plus the exact image change: Defender ASR rules (against Microsoft's canonical rule list), Controlled Folder Access, network and cloud-delivered protection, Exploit Protection, AppLocker/WDAC, SmartScreen, UAC consent level, Guest account, features to strip, admin-count trim, and null-session and remote-registry hardening.
+Every check reports current state plus the exact image change: Defender ASR rules (against Microsoft's canonical rule list), Controlled Folder Access, network and cloud-delivered protection, Exploit Protection, application control (effective WDAC user-mode enforcement, Smart App Control and the effective AppLocker policy), SmartScreen, UAC consent level, Guest account, features to strip, admin-count trim, and null-session and remote-registry hardening.
 
 ## Hardening workflow
 
