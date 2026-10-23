@@ -230,3 +230,8 @@ For use only on systems you own or are explicitly authorized to audit. Derived f
 GNU General Public License v2 or later, with PEASS-ng's clarifications, because WinHostPEAS is a derived work of PEASS-ng. See [LICENSE](LICENSE).
 
 You are free to use, modify and share WinHostPEAS. If you redistribute it or a modified version, keep the copyright notices and the credit (WinHostPEAS by Teon Moore / [CyberAutomations](https://cyberautomations.com), based on PEASS-ng), and make your source available under the same license.
+
+
+<!-- ca-tracked-link -->
+---
+Built by [CyberAutomations](https://cyberautomations.com/?utm_source=github&utm_medium=readme&utm_campaign=winhostpeas). Need something like this built for your business? Start there.
