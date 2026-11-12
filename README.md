@@ -1,22 +1,52 @@
-# WinHostPEAS
+# WinHostPEAS: read-only Windows security posture audit in PowerShell
 
-**A blue-team refit of winPEAS.ps1: the attacker's local enumeration engine rebuilt as a passive, read-only posture audit for Windows Server 2019/2022/2025 and Windows 10/11, including IIS deep recon.**
+WinHostPEAS is a read-only PowerShell script that audits the security posture of one Windows host, written for blue teams, sysadmins and image builders.
 
-WinHostPEAS keeps the enumeration surface an attacker would walk on a host, but turns every check around. You get structured findings with severity and remediation instead of exploit paths, secret detection instead of secret exfiltration, and JSON/CSV/HTML reports built for unattended fleet runs.
+It is a blue-team refit of [winPEAS.ps1](https://github.com/peass-ng/PEASS-ng) (PEASS-ng / @RandolphConley). It walks the same ground an attacker would enumerate after landing on a host, on Windows Server 2019/2022/2025 and Windows 10/11, including a deep IIS audit. Each check produces a finding with a severity and a fix, where winPEAS would print an exploit path. Secrets are detected and redacted, and the results are written as JSON, CSV and an HTML dashboard that suit unattended fleet runs. No offensive tooling is retained.
 
-Derived from [winPEAS.ps1](https://github.com/peass-ng/PEASS-ng) (PEASS-ng / @RandolphConley). No offensive tooling is retained.
+```mermaid
+flowchart LR
+  Parts["parts/*.ps1<br/>source modules"] --> Build["build.ps1<br/>ordered concat, parse check,<br/>comment strip"]
+  Build --> Script["WinHostPEAS.ps1<br/>single shipped file"]
+  Host[("Local host state:<br/>registry, WMI, socket tables,<br/>files and ACLs")] --> Checks
+  Tools["Read-only commands:<br/>auditpol, secedit, bcdedit,<br/>netsh, sc.exe sdshow, whoami"] --> Checks
+  subgraph Run["One audit run"]
+    Checks["Check sections"] --> Engine["Findings engine<br/>Add-Finding, Get-Redacted"]
+    Checks --> Inv["Inventory lists"]
+    Engine --> Reports["Write-Reports"]
+    Inv --> Reports
+  end
+  Script --> Checks
+  Engine --> Console["Console output"]
+  Reports --> Files["JSON, CSV, HTML,<br/>inventory CSVs"]
+  Engine --> Exit["Exit code"]
+```
 
----
+## Contents
 
-## Two guarantees
+- [What it guarantees](#what-it-guarantees)
+- [How it differs from winPEAS](#how-it-differs-from-winpeas)
+- [How to run it](#how-to-run-it)
+- [Output formats](#output-formats)
+- [What it checks](#what-it-checks)
+- [Hardening a golden image](#hardening-a-golden-image)
+- [Unattended fleet deployment](#unattended-fleet-deployment)
+- [FAQ](#faq)
+- [Building from source](#building-from-source)
 
-**It sends nothing.** Every check reads local state only: registry, WMI, local socket tables, local files. There are no ICMP sweeps, no port scans, no banner grabs, and no LDAP or NTP queries. Nothing is sent to a domain controller. Domain membership comes from `Win32_ComputerSystem`, never from contacting a DC. The external binaries it shells out to are all read-only verbs: `auditpol /get`, `secedit /export`, `bcdedit /enum`, `netsh ... show`, `whoami /groups`.
+## What it guarantees
 
-**It changes nothing.** No registry writes, no service or policy changes, no ACL edits. It writes its own reports to `-OutputDir` and one temporary secedit export to `%TEMP%`, which it then deletes. Remediation text tells you what to change; the tool never changes it for you.
+### It sends nothing
 
-You can verify both by grepping the single shipped script. Neither claim depends on trusting this document.
+Every check reads local state only: registry, WMI, local socket tables, local files. There are no ICMP sweeps, port scans or banner grabs, and no LDAP or NTP queries. Nothing is sent to a domain controller. Domain membership comes from `Win32_ComputerSystem`. The external binaries it shells out to are all read-only verbs: `auditpol /get`, `secedit /export`, `bcdedit /enum`, `netsh ... show`, `sc.exe sdshow`, `whoami /priv`.
 
-## Why it exists
+### It changes nothing
+
+The script makes no registry writes, no service or policy changes and no ACL edits. It writes its own reports to `-OutputDir` and one temporary secedit export to `%TEMP%`, which it then deletes. Remediation text tells you what to change. The tool never changes it for you.
+
+You can check both by grepping the single shipped script, so you do not have to take this README's word for it.
+
+## How it differs from winPEAS
 
 winPEAS answers "how do I escalate from here?" WinHostPEAS answers "what would an attacker find if they landed here, and how do I close it first?"
 
@@ -29,7 +59,7 @@ winPEAS answers "how do I escalate from here?" WinHostPEAS answers "what would a
 | Network | Active scanning | Nothing sent, local reads only |
 | Unattended | No | Exit code = Critical+High count |
 
-## Usage
+## How to run it
 
 ```powershell
 # Fast posture audit
@@ -42,7 +72,7 @@ pwsh -File WinHostPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStam
 | Switch | Effect |
 |---|---|
 | `-FullCheck` | Adds a redacted secret-pattern sweep of credential-bearing directories and registry areas |
-| `-OutputDir <path>` | Report destination (default `.\WinHostPEAS_Output`); use a UNC path for fleet centralization |
+| `-OutputDir <path>` | Report destination (default `.\WinHostPEAS_Output`); use a UNC path to collect reports from a fleet in one place |
 | `-TimeStamp` | Per-section elapsed-time stamps |
 | `-NoReport` | Console only, no files written |
 | `-NoLaunch` | Do not open the HTML dashboard; use this for unattended runs |
@@ -50,23 +80,95 @@ pwsh -File WinHostPEAS.ps1 -OutputDir \\server\share\audits -FullCheck -TimeStam
 
 Reference runtimes on a Windows 11 workstation with a few hundred programs installed: about 80 seconds by default (the inventory adds about 10), longer with `-FullCheck`.
 
-## Run it elevated
+```mermaid
+flowchart TD
+  Start["pwsh -File WinHostPEAS.ps1"] --> Elev{"Running elevated?"}
+  Elev -->|yes| Full["Info finding: full coverage"]
+  Elev -->|no| Partial["Low finding: partial coverage.<br/>Gated checks report 'not assessed'"]
+  Full --> Sections["Run check sections in build order.<br/>Each finding prints to the console"]
+  Partial --> Sections
+  Sections --> FC{"-FullCheck?"}
+  FC -->|yes| Sweep["Redacted secret-pattern sweep<br/>of set folders and registry areas"]
+  FC -->|no| Rest["Remaining sections,<br/>inventory runs last"]
+  Sweep --> Rest
+  Rest --> Summary["Console summary: severity counts,<br/>first 10 Critical or High"]
+  Summary --> NR{"-NoReport?"}
+  NR -->|no| Write["Write JSON, CSV, HTML<br/>and inventory CSVs"]
+  Write --> NL{"-NoLaunch?"}
+  NL -->|no| Open["Open HTML report in browser"]
+  NL -->|yes| Exit["Exit code = Critical + High count,<br/>capped at 250"]
+  Open --> Exit
+  NR -->|yes| Exit
+```
 
-The tool works fine as a standard user, but about a dozen checks need administrator: audit policy, the secedit baseline, boot configuration, Security event log settings, BitLocker, WMI event subscriptions, connectivity history, the scheduled-task file baseline, and other users' process details.
+### Run it elevated
 
-When a check cannot run, WinHostPEAS says so. It emits an explicit "not assessed (needs elevation)" finding instead of reporting a clean result. That rule drives a lot of the design: a check that could not execute must never look like a check that found nothing wrong. A banner at the top of every run states which context it ran in.
+The tool works as a standard user, but about a dozen checks need administrator: audit policy, the secedit baseline, boot configuration, Security event log settings, BitLocker, WMI event subscriptions, connectivity history, the scheduled-task file baseline, and other users' process details.
 
-If you audit only non-elevated, expect partial coverage, and read the "not assessed" findings as gaps rather than passes.
+When a check cannot run, WinHostPEAS says so. It emits an explicit "not assessed (needs elevation)" finding and does not report a clean result. A check that could not execute must never look like a check that found nothing wrong, and much of the design follows from that rule. A banner at the top of every run states which context it ran in.
+
+If you audit only non-elevated, expect partial coverage, and read the "not assessed" findings as gaps, not passes.
+
+## Output formats
+
+Every check funnels into one collector. Each finding carries `Timestamp, Host, Severity (Critical/High/Medium/Low/Info), Category, Title, Detail, Evidence, Remediation`.
+
+| Output | File | Contents |
+|---|---|---|
+| Console | none | One line per finding with detail and fix, then severity counts and the first 10 Critical or High items |
+| JSON | `WinHostPEAS_<HOST>_<timestamp>.json` | A `Meta` block, the `Findings` array, and the three lists under `Inventory` |
+| CSV | `WinHostPEAS_<HOST>_<timestamp>.csv` | One row per finding |
+| HTML | `WinHostPEAS_<HOST>_<timestamp>.html` | Dashboard with severity tiles, text search, a category filter, an executive summary and filterable inventory tables |
+| Inventory CSVs | `..._inventory_services.csv`, `..._inventory_software.csv`, `..._inventory_folders.csv` | Services, installed programs and program folders |
+| Exit code | none | Count of Critical and High findings, capped at 250 |
+
+With `-Obfuscate`, the files are named `rpt_<random>_<timestamp>` and the tool label in the report becomes "Posture Audit".
+
+```mermaid
+flowchart LR
+  Find["Findings list"] --> Json["JSON:<br/>Meta, Findings, Inventory"]
+  Find --> Csv["Findings CSV"]
+  Find --> Html["HTML dashboard"]
+  Find --> Exec["Executive summary counts"]
+  Exec --> Html
+  Inv["Inventory:<br/>services, programs, folders"] --> Json
+  Inv --> InvCsv["Three inventory CSVs"]
+  Inv --> Html
+  Find --> Exit["Exit code"]
+  Json --> Siem["Your SIEM or CMDB"]
+  Exit --> Sched["Your scheduler or deployment tool"]
+```
+
+### Handle the reports carefully
+
+Reports enumerate credential-adjacent material: paths, account names, exclusion lists, listening services. Secret values are redacted, but the reports still describe your attack surface in detail. Treat them as evidence, not as logs. The supplied `.gitignore` excludes report artifacts for that reason.
+
+The tool offers no encryption of its own, on purpose. Protect reports at the storage layer: write to a share with real access controls, or to a BitLocker or EFS-protected volume. A passphrase switch on a scanner would get more trust than it has earned.
 
 ## What it checks
 
-### Findings engine
-
-Every check funnels into one collector. Each finding carries `Timestamp, Host, Severity (Critical/High/Medium/Low/Info), Category, Title, Detail, Evidence, Remediation`. The process exit code equals the Critical+High count, so deployment tooling can triage without parsing anything.
+| Area | Examples of what is inspected | Source |
+|---|---|---|
+| Defender and AV posture | Realtime status, Tamper Protection, exclusions, signature age | `parts/20_system.ps1` |
+| Logging and detection coverage | Audit policy, command-line capture, PowerShell logging, event forwarding | `parts/20_system.ps1` |
+| Credential exposure | WDigest, LSA Protection, Credential Guard, answer files, stored keys | `parts/21_creds.ps1` |
+| Privilege escalation | Service DACLs and binaries, unquoted paths, `PATH` folders, UAC | `parts/22_privesc.ps1` |
+| Network attack surface | SMBv1 and signing, LLMNR/NBT-NS, RDP NLA, listening ports, shares | `parts/23_network.ps1` |
+| Account hygiene and identity | Password policy, local admins, LAPS, BitLocker, NTLM policy | `parts/23_network.ps1`, `parts/24_ad_software.ps1` |
+| Passive network visibility | ARP and neighbour cache, established connections | `parts/25_ot_discovery.ps1` |
+| Service and OT inventory | Listeners by process, BMS/OT protocol ports, vendor software | `parts/26_service_inventory.ps1` |
+| Loopback and tunnels | Loopback listeners, `netsh portproxy`, SSH tunnels | `parts/27_loopback.ps1` |
+| IIS and web server | Sites, app pools, web.config, certificates, WinRM | `parts/28_iis.ps1` |
+| OS and crypto surface | Build support status, SCHANNEL, cipher suites, secedit baseline | `parts/29_os_vulns.ps1` |
+| Persistence | Winlogon, WMI subscriptions, COM hijacks, IFEO, LSA packages | `parts/30_hardening.ps1`, `parts/33_advanced.ps1`, `parts/34_btfm_expansion.ps1` |
+| Image hardening baseline | ASR rules, application control, SmartScreen, Exploit Protection | `parts/30_hardening.ps1` |
+| Connectivity history | Past networks, WiFi profiles, DNS cache, RDP and SSH history | `parts/32_history.ps1` |
+| Security features | EDR presence, VBS and HVCI, Secure Boot, Sysmon | `parts/35_security_features.ps1` |
+| Asset inventory | Services, installed programs, program folders | `parts/36_inventory.ps1` |
 
 ### Secret detection without secret exposure
 
-The winPEAS regex corpus (cloud keys, GitHub/GitLab tokens, JWTs, private-key blocks, connection strings, and more) is kept for detection only. Matches are recorded with the value replaced by a fingerprint such as `<redacted:52ch, ends ...Xy9a>`. Removed outright: WiFi password dumps, clipboard printing, PasswordVault dumping, DPAPI decryption, history echoing. You learn that a secret exists and where it lives, which is enough to rotate it and not enough to leak it from a report left on a share.
+The winPEAS regex corpus (cloud keys, GitHub/GitLab tokens, JWTs, private-key blocks, connection strings, and more) is kept for detection only. Matches are recorded with the value replaced by a fingerprint such as `<redacted:52ch, ends ...Xy9a>`. Removed outright: WiFi password dumps, clipboard printing, PasswordVault dumping, DPAPI decryption, history echoing. You learn that a secret exists and where it lives. That is enough to rotate it, and too little to leak it from a report left on a share.
 
 ### Credential exposure
 
@@ -84,11 +186,11 @@ UAC coverage distinguishes *EnableLUA absent* from *EnableLUA = 0*, because a de
 
 ### Defender and AV posture
 
-Realtime status, Tamper Protection, running mode (normal, passive or EDR block mode), signature freshness, scan recency, and a full exclusion inventory. Exclusions are the first thing an attacker adds. A standard user only sees a subset of them, so a non-elevated run labels the count PARTIAL instead of presenting it as complete.
+Realtime status, Tamper Protection, running mode (normal, passive or EDR block mode), signature freshness, scan recency, and a full exclusion inventory. Attackers add exclusions early, so the list matters. A standard user only sees a subset of them, so a non-elevated run labels the count PARTIAL and does not present it as complete.
 
 ### Logging and detection coverage
 
-auditpol subcategories read by GUID (so the parse is not tied to an English display name), process-creation command-line capture, Security event log sizing, Windows Event Forwarding, and PowerShell ScriptBlock/Module/Transcription logging gaps. This is the telemetry an attacker hopes is missing.
+auditpol subcategories read by GUID (so the parse is not tied to an English display name), process-creation command-line capture, Security event log sizing, Windows Event Forwarding, and PowerShell ScriptBlock/Module/Transcription logging gaps.
 
 ### Security features and detection coverage
 
@@ -102,6 +204,10 @@ SMBv1 and SMB signing, LLMNR/NBT-NS, RDP NLA and SecurityLayer, listening-port i
 
 ARP and neighbour cache plus established-connection inventory, with MAC-OUI vendor tagging. This shows who the host already talks to. Nothing is probed.
 
+### Connectivity history
+
+Networks the host has joined before (from the NetworkList registry keys, which need elevation), saved WiFi profile names, the DNS resolver cache, RDP servers previously connected to, PuTTY sessions and SSH `known_hosts`, static routes, mapped drives and recent UNC paths, and custom inbound firewall allow rules.
+
 ### Service and OT inventory
 
 Local listeners mapped to owning process and binary version, against a port dictionary covering IT services and BMS/OT protocols (Modbus/TCP 502, BACnet 47808, EtherNet/IP 44818, OPC-UA 4840/4843, DNP3 20000, Niagara Fox, Omron FINS, CoDeSys). OT listeners are flagged with IEC 62443 SR 5.1 zone and conduit remediation. Installed software is matched against a BMS vendor dictionary so controller and HMI software is versioned for CVE watchlisting.
@@ -110,9 +216,9 @@ Local listeners mapped to owning process and binary version, against a port dict
 
 Three lists, written as separate CSV files next to the findings and shown as filterable tables at the bottom of the HTML report (and under `Inventory` in the JSON):
 
-- **Services:** every service with state, start mode, account, binary path, and the binary's company and version.
-- **Installed programs:** the 64-bit and 32-bit Uninstall keys plus every loaded user hive, so per-user installs (which skip admin approval) are included and labeled with their owner.
-- **Program folders:** every top-level folder under Program Files and Program Files (x86), plus the ProgramData and user AppData (`Local`, `Local\Programs`, `Roaming`) folders that hold real executables. Installer and updater stubs do not count, and each folder is named by its largest executable.
+- Services: every service with state, start mode, account, binary path, and the binary's company and version.
+- Installed programs: the 64-bit and 32-bit Uninstall keys plus every loaded user hive, so per-user installs (which skip admin approval) are included and labeled with their owner.
+- Program folders: every top-level folder under Program Files and Program Files (x86), plus the ProgramData and user AppData (`Local`, `Local\Programs`, `Roaming`) folders that hold real executables. Installer and updater stubs do not count, and each folder is named by its largest executable.
 
 Findings summarize the lists and point at what deserves a look: third-party services, services running from ProgramData or a user profile, per-user installs, programs living in AppData, and folders whose programs never registered an uninstall entry (portable tools and leftovers that patch tooling cannot see). Other users' AppData is only readable elevated; a non-elevated run names the profiles it skipped.
 
@@ -124,9 +230,9 @@ Loopback-bound listeners with owning process, loopback conversations, `netsh por
 
 Accounts carrying the `PASSWD_NOTREQD` flag, password policy, never-expiring passwords, local admin inventory, LAPS presence, BitLocker, screen-lock timeout. Domain-joined hosts also get NTLM policy and ADCS ESC10 Schannel UPN mapping, both read from the local registry.
 
-The blank-password check is worth explaining, because the obvious version of it is wrong. `PASSWD_NOTREQD` means a blank password is *permitted*, not that the account has one, and the flag is a routine artifact of programmatic account creation. Reporting it as "no password" raises a false alarm on ordinary service accounts. Confirming the real state would mean attempting authentication, which writes failed-logon events and can trip lockout policy, so the tool does not do it. Instead it reports the flag accurately and scales severity by `LimitBlankPasswordUse`, since a blank password that cannot be used over the network is a very different problem from one that can.
+The blank-password check needs explaining, because the obvious version of it is wrong. `PASSWD_NOTREQD` means a blank password is *permitted*, not that the account has one, and the flag is a routine artifact of programmatic account creation. Reporting it as "no password" raises a false alarm on ordinary service accounts. Confirming the real state would mean attempting authentication, which writes failed-logon events and can trip lockout policy, so the tool does not do it. It reports the flag accurately and scales severity by `LimitBlankPasswordUse`, since a blank password that cannot be used over the network is a much smaller problem than one that can.
 
-Domain-side hygiene such as Kerberoastable SPNs and gMSA read permissions is deliberately not assessed, because every way to check it means querying a domain controller.
+Domain-side hygiene such as Kerberoastable SPNs and gMSA read permissions is not assessed, because every way to check it means querying a domain controller.
 
 ### Patch posture
 
@@ -142,23 +248,23 @@ Build and end-of-support status, SCHANNEL protocol inventory (absent registry ke
 
 ### Persistence deep-dive
 
-The quieter slots beyond autoruns: Winlogon Shell/Userinit/Taskman hijacks, WMI permanent event subscriptions, per-user COM hijacks, IFEO Debuggers and SilentProcessExit monitors, AppInit_DLLs, non-standard LSA Security, Authentication and Notification packages, AppCertDlls, accounts hidden from the logon screen (`SpecialAccounts\UserList`), Active Setup StubPaths, netsh helper DLLs, screensaver hijacks. Winlogon values are compared token by token, not by substring.
+The less-watched slots beyond autoruns: Winlogon Shell/Userinit/Taskman hijacks, WMI permanent event subscriptions, per-user COM hijacks, IFEO Debuggers and SilentProcessExit monitors, AppInit_DLLs, non-standard LSA Security, Authentication and Notification packages, AppCertDlls, accounts hidden from the logon screen (`SpecialAccounts\UserList`), Active Setup StubPaths, netsh helper DLLs, screensaver hijacks. Winlogon values are compared token by token, not by substring.
 
 ### Advanced persistence and obfuscation
 
 UAC-bypass registry residue (fodhelper, eventvwr, sdclt), file-association and ProgID hijacks across HKLM and HKCU, non-standard service recovery commands, AMSI provider state including provider DLLs outside protected paths, encoded or reflective PowerShell in console history, and core Windows binaries running outside their expected directories.
 
-Scheduled tasks are scanned for obfuscated commands, including tasks under `\Microsoft\`. Masquerading hides there, so excluding that tree would blind the check at its most useful target.
+Scheduled tasks are scanned for obfuscated commands, including tasks under `\Microsoft\`. Masquerading tasks hide in that tree, so excluding it would skip the place the check is most useful.
 
 ### Extended persistence and hardening baseline
 
-The autostart slots that sit beside the ones everyone checks, drawn from the Blue Team Field Manual.
+The autostart slots that sit beside the commonly checked ones, drawn from the Blue Team Field Manual.
 
 `RunOnceEx`, `RunServices` and `RunServicesOnce` under both hives, the policy `Explorer\Run` keys, `ShellServiceObjectDelayLoad`, and the legacy `Load`/`Run`/`Scripts` values under the HKCU Windows NT key. Group Policy logon and startup script registrations. Legacy startup files (`winstart.bat`, `wininit.ini`, `autoexec.bat`, `autoexec.nt`) and `win.ini` `run=`/`load=` directives.
 
 `HKCU\Environment` gets two checks: `UserInitMprLogonScript`, which runs at every logon of that user and appears in no machine-wide autoruns audit (T1037.001), and user-writable directories on the user `PATH`, which can shadow a system binary invoked without a full path.
 
-Session Manager `BootExecute` against its expected default, and `KnownDLLs` validated by signature rather than by name. The expected KnownDLLs set varies by Windows version and architecture, so this checks that each entry resolves to a Microsoft-signed DLL in System32 instead of comparing against a name list that would drift.
+Session Manager `BootExecute` against its expected default, and `KnownDLLs` validated by signature. The expected KnownDLLs set varies by Windows version and architecture, and a name list would drift, so the check confirms that each entry resolves to a Microsoft-signed DLL in System32.
 
 Browser Helper Objects, deduplicated across the native and Wow6432Node registrations, resolved to their backing DLL and flagged when that DLL sits outside Windows or Program Files.
 
@@ -172,7 +278,7 @@ Suspect commands and DLLs surfaced by these checks carry a SHA-256 in the findin
 
 Every check reports current state plus the exact image change: Defender ASR rules (against Microsoft's canonical rule list), Controlled Folder Access, network and cloud-delivered protection, Exploit Protection, application control (effective WDAC user-mode enforcement, Smart App Control and the effective AppLocker policy), SmartScreen, UAC consent level, Guest account, features to strip, admin-count trim, and null-session and remote-registry hardening.
 
-## Hardening workflow
+## Hardening a golden image
 
 Run against the golden image, filter to Category `Hardening`, and treat each Remediation line as a build change. Re-run after each change; the exit code falls as the image hardens.
 
@@ -183,15 +289,33 @@ The `Persistence` and `PrivEsc` categories double as regression tests. A finishe
 1. Copy `WinHostPEAS.ps1` to a share, or push it with your deployment tool.
 2. Schedule: `pwsh -NoProfile -ExecutionPolicy Bypass -File <path>\WinHostPEAS.ps1 -OutputDir \\server\share\WinHostPEAS -FullCheck -NoLaunch`
 3. Each host writes `WinHostPEAS_<HOST>_<timestamp>.{json,csv,html}`, plus `_inventory_services.csv`, `_inventory_software.csv` and `_inventory_folders.csv` with the same prefix.
-4. Triage on exit code, or ingest the JSON into a SIEM or CMDB. The schema is stable: one array of finding objects under `Findings`, a `Meta` block, and the three inventory lists under `Inventory`.
+4. Triage on exit code, or ingest the JSON into a SIEM or CMDB. The JSON is one array of finding objects under `Findings`, a `Meta` block, and the three inventory lists under `Inventory`.
 
-Run it elevated. See the elevation section above for what you lose otherwise.
+Run it elevated. See [Run it elevated](#run-it-elevated) for what you lose otherwise.
 
-## Handle the reports carefully
+[splunk_detection_ideas.md](splunk_detection_ideas.md) holds starting-point Splunk searches and dashboard ideas for a fleet that ingests these reports. They are untested against a live indexer and need field names checked against your own Splunk setup.
 
-Reports enumerate credential-adjacent material: paths, account names, exclusion lists, listening services. Secret values are redacted, but the reports still describe your attack surface in detail. Treat them as evidence rather than as logs. The supplied `.gitignore` excludes report artifacts for that reason.
+## FAQ
 
-The tool deliberately offers no encryption of its own. Report protection belongs to the storage layer, where it can be done properly: write to a share with real access controls, or to a BitLocker or EFS-protected volume. A passphrase switch bolted onto a scanner invites people to trust it more than it deserves.
+### Does WinHostPEAS send any network traffic?
+
+No. Checks read the registry, WMI, the local socket tables and local files. Neighbours come from the ARP cache and open ports from the local socket table, so nothing is probed. Domain controllers are never contacted, which is also why domain-side checks such as Kerberoastable SPNs are out of scope.
+
+### Do I need administrator rights to run it?
+
+No, but a standard-user run is partial. The script detects elevation at start, prints a banner, and records a finding that lists the checks that were limited or skipped. Each gated check then reports "not assessed" and never reports a pass.
+
+### Will it print or save the passwords and keys it finds?
+
+No. A match is stored as its length and last four characters, for example `<redacted:52ch, ends ...Xy9a>`, along with the file or registry path. The value itself is not written to the console or to any report.
+
+### What does -FullCheck add?
+
+A pattern sweep of a fixed set of locations: `.ssh`, `.aws`, `.azure`, `.kube`, `.config` and `AppData\Roaming` in the current user's profile, `C:\Windows\Temp`, the Windows `Panther` folder, and the Winlogon, Run and Services registry areas. It reads config-like files under 1 MB, up to 300 per folder. It does not scan whole drives.
+
+### What happens on a host without IIS?
+
+The IIS section records one Info finding, "IIS not installed on this host", and skips the web server checks. Every other section runs as normal.
 
 ## Building from source
 
@@ -211,7 +335,7 @@ parts/            source modules
 
 Two notes for contributors. The assembly order in `build.ps1` is an explicit list, so a new part file that is not added to it will silently never ship. And `parts/04_installedapps.ps1` and `parts/05_regex.ps1` are inherited dead code, deliberately excluded from the build.
 
-## Extending
+### Extending
 
 | What | Where |
 |---|---|
@@ -230,6 +354,10 @@ For use only on systems you own or are explicitly authorized to audit. Derived f
 GNU General Public License v2 or later, with PEASS-ng's clarifications, because WinHostPEAS is a derived work of PEASS-ng. See [LICENSE](LICENSE).
 
 You are free to use, modify and share WinHostPEAS. If you redistribute it or a modified version, keep the copyright notices and the credit (WinHostPEAS by [CyberAutomations](https://cyberautomations.com/?utm_source=github&utm_medium=readme&utm_campaign=winhostpeas), based on PEASS-ng), and make your source available under the same license.
+
+## More from CyberAutomations
+
+Read the [WinHostPEAS project page](https://cyberautomations.com/work/winhostpeas?utm_source=github&utm_medium=readme&utm_campaign=winhostpeas) for the background on this tool. Related free tool: [OTDraw](https://cyberautomations.com/tools/otdraw?utm_source=github&utm_medium=readme&utm_campaign=winhostpeas), a browser editor for OT and ICS network diagrams.
 
 
 <!-- ca-tracked-link -->
