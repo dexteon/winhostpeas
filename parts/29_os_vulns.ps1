@@ -288,6 +288,14 @@ try {
   secedit /export /cfg $secOut /quiet 2>$null | Out-Null
   if (Test-Path $secOut) {
     $sec = Get-Content $secOut -ErrorAction SilentlyContinue
+    # Keep the [Privilege Rights] section for the user-rights check in the
+    # privilege-escalation paths section (holders are SIDs, prefixed with '*').
+    $script:SeceditPrivRights = @{}
+    foreach ($l in $sec) {
+      if ($l -match '^\s*(Se\w+Privilege)\s*=\s*(.*)$') {
+        $script:SeceditPrivRights[$Matches[1]] = @($Matches[2] -split ',' | ForEach-Object { $_.Trim().TrimStart('*') } | Where-Object { $_ })
+      }
+    }
     # Minimum password length and lockout threshold are reported once, from net accounts in the
     # Accounts section (works non-elevated). Here they are recorded as supporting detail only.
     $secVal = @{}

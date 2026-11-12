@@ -38,7 +38,10 @@ $script:SecretPatterns = Get-SecretPatterns
 # High-signal credential files an attacker (or malware) would target first.
 $script:SensitiveFileTargets = @(
   "$env:windir\Panther\Unattend.xml"
-  "$env:windir\Panther\unattend.xml"
+  "$env:windir\Panther\Unattended.xml"
+  "$env:windir\Panther\Unattend\Unattend.xml"
+  "$env:windir\Panther\Unattend\Unattended.xml"
+  "$env:windir\System32\Sysprep\Panther\unattend.xml"
   "$env:windir\System32\Sysprep\unattend.xml"
   "$env:windir\System32\Sysprep\unattended.xml"
   'C:\Windows\sysprep\sysprep.xml'
@@ -46,6 +49,8 @@ $script:SensitiveFileTargets = @(
   'C:\Windows\sysprep.inf'
   'C:\unattend.txt'
   'C:\unattend.inf'
+  'C:\unattend.xml'
+  'C:\autounattend.xml'
   "$env:USERPROFILE\.aws\credentials"
   "$env:USERPROFILE\.azure\accessTokens.json"
   "$env:USERPROFILE\.azure\azureProfile.json"
@@ -57,6 +62,9 @@ $script:SensitiveFileTargets = @(
   "$env:USERPROFILE\.git-credentials"
   "$env:USERPROFILE\_netrc"
 )
+# NTFS is case-insensitive, so two spellings of one path would report one file
+# twice. Sort-Object -Unique compares case-insensitively.
+$script:SensitiveFileTargets = @($script:SensitiveFileTargets | Sort-Object -Unique)
 
 function Test-FileForSecrets {
   param([string]$Path, [string]$Context = '')

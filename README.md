@@ -38,7 +38,7 @@ flowchart LR
 
 ### It sends nothing
 
-Every check reads local state only: registry, WMI, local socket tables, local files. There are no ICMP sweeps, port scans or banner grabs, and no LDAP or NTP queries. Nothing is sent to a domain controller. Domain membership comes from `Win32_ComputerSystem`. The external binaries it shells out to are all read-only verbs: `auditpol /get`, `secedit /export`, `bcdedit /enum`, `netsh ... show`, `sc.exe sdshow`, `whoami /priv`.
+Every check reads local state only: registry, WMI, local socket tables, local files. There are no ICMP sweeps, port scans or banner grabs, and no LDAP or NTP queries. Nothing is sent to a domain controller. Domain membership comes from `Win32_ComputerSystem`. The external binaries it shells out to are all read-only verbs: `auditpol /get`, `secedit /export`, `bcdedit /enum`, `netsh ... show`, `sc.exe sdshow`, `whoami /priv`, `whoami /groups`, `cmdkey /list` (entries counted, never printed).
 
 ### It changes nothing
 
@@ -153,6 +153,7 @@ The tool offers no encryption of its own, on purpose. Protect reports at the sto
 | Logging and detection coverage | Audit policy, command-line capture, PowerShell logging, event forwarding | `parts/20_system.ps1` |
 | Credential exposure | WDigest, LSA Protection, Credential Guard, answer files, stored keys | `parts/21_creds.ps1` |
 | Privilege escalation | Service DACLs and binaries, unquoted paths, `PATH` folders, UAC | `parts/22_privesc.ps1` |
+| Privilege escalation paths | Privileged group membership, user rights, phantom DLLs, privileged tasks, stored credentials, relay preconditions | `parts/37_privesc_paths.ps1` |
 | Network attack surface | SMBv1 and signing, LLMNR/NBT-NS, RDP NLA, listening ports, shares | `parts/23_network.ps1` |
 | Account hygiene and identity | Password policy, local admins, LAPS, BitLocker, NTLM policy | `parts/23_network.ps1`, `parts/24_ad_software.ps1` |
 | Passive network visibility | ARP and neighbour cache, established connections | `parts/25_ot_discovery.ps1` |
@@ -183,6 +184,35 @@ Service DACLs are read with `sc.exe sdshow` and flagged when a low-privilege pri
 Every permission check works by SID against low-privilege principals (Everyone, Users, Authenticated Users, INTERACTIVE and similar, plus the running user only when not elevated), so results are the same in any Windows language and do not depend on who runs the audit. Deny and inherit-only entries are skipped.
 
 UAC coverage distinguishes *EnableLUA absent* from *EnableLUA = 0*, because a deleted value implies tampering and calls for different remediation. It also flags silent-elevation consent and `LocalAccountTokenFilterPolicy = 1`, the setting that makes pass-the-hash work against admin shares.
+
+### Privilege escalation paths
+
+The escalation paths seen most often in real intrusions and red-team engagements (MITRE ATT&CK TA0004, the PayloadsAllTheThings and HackTricks Windows checklists), and where each one is checked. Every check is a passive local read.
+
+| Path | What is checked | Source |
+|---|---|---|
+| Local Administrators | Direct members, local groups nested inside it (expanded one level), directory groups other than Domain Admins, directory users, broad principals (Everyone, Users, Domain Users and similar), orphaned SIDs. Directory groups are listed, not expanded, because that needs a DC query | `37_privesc_paths.ps1` |
+| Built-in Administrator (RID 500) | Enabled, not renamed | `23_network.ps1` |
+| Other privileged local groups | Backup, Server, Print and Account Operators, Hyper-V and Storage Replica Administrators, Network Configuration Operators, Remote Desktop Users, Remote Management Users, Event Log Readers, Distributed COM Users, Performance Log Users, Cryptographic Operators, DnsAdmins, docker-users | `37_privesc_paths.ps1` |
+| The audit account's own groups | Split-token administrator, membership of admin-equivalent groups, Domain/Schema/Enterprise Admins SIDs | `37_privesc_paths.ps1` |
+| Token privileges of the running account | SeImpersonate, SeAssignPrimaryToken (Potato family), SeBackup, SeRestore, SeDebug, SeTakeOwnership, SeLoadDriver, SeManageVolume, SeTcb, SeCreateToken, SeRelabel, SeTrustedCredManAccess | `22_privesc.ps1` |
+| User-rights assignment (elevated) | Non-default holders of the same privileges, from the secedit export | `37_privesc_paths.ps1` |
+| Potato-family exposure | Network-facing services (IIS, SQL Server, Tomcat and similar) running as accounts that hold SeImpersonate | `37_privesc_paths.ps1` |
+| Services | Unquoted paths, writable binaries, folders and registry keys, service DACLs (SDDL), svchost ServiceDll | `22_privesc.ps1` |
+| AlwaysInstallElevated | Both hives (Critical) or one hive (Medium) | `22_privesc.ps1` |
+| `PATH` and DLL hijack | Writable machine and user `PATH` folders, SafeDllSearchMode, KnownDLLs; phantom DLLs loaded by SYSTEM services (wlbsctrl, WptsExtensions, cdpsgshims, TSMSISrv, TSVIPSrv), both planted copies and open hijack slots | `34_btfm_expansion.ps1`, `37_privesc_paths.ps1` |
+| Scheduled tasks | Writable executables of non-Microsoft tasks; for tasks running as SYSTEM, a service account, the Administrators group or with highest privileges: writable action folders, missing action binaries and writable script arguments | `22_privesc.ps1`, `37_privesc_paths.ps1` |
+| Autoruns | Writable startup-folder items; writable HKLM Run targets and writable Run keys | `22_privesc.ps1`, `37_privesc_paths.ps1` |
+| Stored credentials | Autologon, unattend and sysprep files, Credential Manager counts, runas /savecred and saved RDP entries (counts only), GPP `cpassword`, SAM hive copies, HiveNightmare ACL | `21_creds.ps1`, `22_privesc.ps1`, `37_privesc_paths.ps1` |
+| UAC | EnableLUA, ConsentPromptBehaviorAdmin, LocalAccountTokenFilterPolicy, secondary CIS values | `22_privesc.ps1` |
+| LAPS | Legacy and Windows LAPS, gated on join state | `23_network.ps1` |
+| WSUS | Update server over HTTP | `22_privesc.ps1` |
+| PrintNightmare | Point and Print policy, Spooler exposure by role | `22_privesc.ps1` |
+| Relay preconditions (KrbRelayUp and similar) | LDAP client signing; LDAP server signing and channel binding on a DC; WebClient service. MachineAccountQuota and DC-side signing on other hosts need a DC query and are out of scope | `37_privesc_paths.ps1` |
+| Vulnerable drivers (BYOVD) | Running drivers against the LOLDrivers name list and by signature; Microsoft driver blocklist, HVCI | `34_btfm_expansion.ps1`, `35_security_features.ps1` |
+| Software with a known LPE | Short watchlist (OpenVPN, TeamViewer, VMware Tools) by fixed version; not a vulnerability scanner | `37_privesc_paths.ps1` |
+| Named pipes | Pipe names matching post-exploitation and remote-execution tool defaults. Pipe DACLs are not read, because opening a pipe is a client connection | `37_privesc_paths.ps1` |
+| WSL | Registered distributions in loaded user hives | `37_privesc_paths.ps1` |
 
 ### Defender and AV posture
 
