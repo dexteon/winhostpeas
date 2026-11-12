@@ -132,14 +132,24 @@ try { $script:PeasServices = @(Get-CimInstance Win32_Service -ErrorAction Stop) 
     -Detail ('Get-CimInstance Win32_Service failed: ' + $_.Exception.Message)
 }
 
-# AlwaysInstallElevated
+# AlwaysInstallElevated. Windows Installer elevates only when BOTH the machine and
+# the user policy are 1, so one hive alone is one policy change away, not open.
+$aieSet = @()
 foreach ($hive in 'HKLM', 'HKCU') {
   $aie = (Get-ItemProperty "${hive}:\SOFTWARE\Policies\Microsoft\Windows\Installer" -ErrorAction SilentlyContinue).AlwaysInstallElevated
-  if ($aie -eq 1) {
-    Add-Finding -Severity Critical -Category 'PrivEsc' -Title "AlwaysInstallElevated=1 ($hive)" `
-      -Detail 'Any MSI (including malicious) installs with SYSTEM privileges.' `
-      -Remediation 'Set AlwaysInstallElevated=0 in both hives (or leave the policy undefined).'
-  }
+  if ($aie -eq 1) { $aieSet += $hive }
+}
+if ($aieSet.Count -eq 2) {
+  Add-Finding -Severity Critical -Category 'PrivEsc' -Title 'AlwaysInstallElevated=1 in both HKLM and HKCU' `
+    -Detail 'Any MSI package, including a malicious one, installs with SYSTEM privileges for this user. MITRE T1548.002.' `
+    -Evidence 'HKLM and HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer::AlwaysInstallElevated' `
+    -Remediation 'Set AlwaysInstallElevated=0 in both hives (or leave the policy undefined).'
+}
+elseif ($aieSet.Count -eq 1) {
+  Add-Finding -Severity Medium -Category 'PrivEsc' -Title ("AlwaysInstallElevated=1 in {0} only" -f $aieSet[0]) `
+    -Detail 'Windows Installer elevates only when both the machine and the user policy are 1. One hive alone is not exploitable, but the other is a single policy change away.' `
+    -Evidence ("{0}:\SOFTWARE\Policies\Microsoft\Windows\Installer::AlwaysInstallElevated" -f $aieSet[0]) `
+    -Remediation 'Set AlwaysInstallElevated=0 (or remove the policy) in both hives.'
 }
 
 # Unquoted service paths. Only the part BEFORE the executable name matters: a
@@ -564,9 +574,24 @@ try {
   $enabledWord = if ($anchor) { "$($anchor.State)".Trim() } else { $null }
   $dangerHeld = 0
   $elevPrivs = @()
+  # What each privilege turns into, so the finding says why it matters.
+  $privWhy = @{
+    SeImpersonatePrivilege          = 'Impersonate any token that connects to this process. The Potato family (JuicyPotato, RoguePotato, PrintSpoofer, GodPotato, EfsPotato) coerces a SYSTEM connection and turns this into SYSTEM.'
+    SeAssignPrimaryTokenPrivilege   = 'Start a process with any token this process can obtain; the same Potato-family path to SYSTEM as SeImpersonate.'
+    SeDebugPrivilege                = 'Open any process, including LSASS and SYSTEM services, for memory read and code injection.'
+    SeBackupPrivilege               = 'Read any file regardless of its ACL, including the SAM, SYSTEM and SECURITY hives and NTDS.dit.'
+    SeRestorePrivilege              = 'Write any file or registry key regardless of its ACL, for example a service binary or ImagePath.'
+    SeLoadDriverPrivilege           = 'Load a kernel driver, the bring-your-own-vulnerable-driver path to kernel code execution.'
+    SeTakeOwnershipPrivilege        = 'Take ownership of any securable object, then rewrite its ACL.'
+    SeCreateTokenPrivilege          = 'Forge an access token with any groups and privileges.'
+    SeTcbPrivilege                  = 'Act as part of the operating system: build a token with arbitrary group SIDs through S4U logon.'
+    SeManageVolumePrivilege         = 'Perform volume maintenance; public tooling uses it to gain write access to the whole system volume.'
+    SeRelabelPrivilege              = 'Change the integrity label of objects, including raising write access to SYSTEM-owned objects.'
+    SeTrustedCredManAccessPrivilege = 'Access Credential Manager as a trusted caller and back up other users'' stored credentials.'
+  }
   foreach ($dangerPriv in @('SeImpersonatePrivilege', 'SeDebugPrivilege', 'SeBackupPrivilege', 'SeRestorePrivilege',
                             'SeLoadDriverPrivilege', 'SeTakeOwnershipPrivilege', 'SeCreateTokenPrivilege', 'SeTcbPrivilege',
-                            'SeAssignPrimaryTokenPrivilege')) {
+                            'SeAssignPrimaryTokenPrivilege', 'SeManageVolumePrivilege', 'SeRelabelPrivilege', 'SeTrustedCredManAccessPrivilege')) {
     $row = $privRows | Where-Object { $_.Name -eq $dangerPriv } | Select-Object -First 1
     if (-not $row) { continue }
     $dangerHeld++
@@ -577,13 +602,13 @@ try {
     if ($script:IsElevated) { $elevPrivs += $dangerPriv; continue }
     if ($isEnabled) {
       Add-Finding -Severity High -Category 'PrivEsc' -Title ("Current user holds {0} (enabled)" -f $dangerPriv) `
-        -Detail 'Dangerous privilege - standard tooling can turn this into SYSTEM or credential access.' `
-        -Remediation 'Remove the account from the granting group/local policy (e.g. Administrators, Backup Operators) unless operationally required.'
+        -Detail ('Dangerous privilege: standard tooling can turn this into SYSTEM or credential access. ' + $privWhy[$dangerPriv]) `
+        -Remediation 'Remove the account from the granting group/local policy (e.g. Administrators, Backup Operators) unless operationally required. MITRE T1134.'
     }
     else {
       Add-Finding -Severity Medium -Category 'PrivEsc' -Title ("Current user holds {0} (present, not enabled)" -f $dangerPriv) `
-        -Detail ('The privilege is in the token in a disabled state. Any process of this user can enable it with AdjustTokenPrivileges, so it is held, not absent. Token state: ' + $state) `
-        -Remediation 'Remove the account from the granting group/local policy unless operationally required.'
+        -Detail ('The privilege is in the token in a disabled state. Any process of this user can enable it with AdjustTokenPrivileges, so it is held, not absent. Token state: ' + $state + '. ' + $privWhy[$dangerPriv]) `
+        -Remediation 'Remove the account from the granting group/local policy unless operationally required. MITRE T1134.'
     }
   }
   if ($elevPrivs.Count -gt 0) {
@@ -592,7 +617,7 @@ try {
       -Remediation 'Keep daily work in a non-admin account so these privileges only exist after a deliberate elevation.'
   }
   if ($dangerHeld -eq 0) {
-    Add-Finding -Severity Info -Category 'PrivEsc' -Title ('Current token holds none of the 9 dangerous privileges ({0} privileges listed by whoami /priv)' -f $privRows.Count)
+    Add-Finding -Severity Info -Category 'PrivEsc' -Title ('Current token holds none of the {0} dangerous privileges ({1} privileges listed by whoami /priv)' -f $privWhy.Count, $privRows.Count)
   }
   if (-not $anchor) {
     Add-Finding -Severity Info -Category 'PrivEsc' -Title 'Token privilege state compared against the English word only' `

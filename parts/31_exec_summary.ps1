@@ -1,7 +1,8 @@
 
 ######################## EXECUTIVE SUMMARY DATA ########################
 # Collected before reports are written; rendered as the tables at the top
-# of the HTML dashboard.
+# of the HTML dashboard. build.ps1 places this part after every check section,
+# so the aggregate counts below include findings from all of them.
 
 $script:Exec = @{
   Admins            = @()
@@ -62,7 +63,8 @@ catch { }
 
 # Aggregates straight from the findings list
 $script:Exec.PersistCritHigh = @($script:Findings | Where-Object { $_.Category -eq 'Persistence' -and $_.Severity -in 'Critical', 'High' }).Count
-$script:Exec.PrivEscCritHigh = @($script:Findings | Where-Object { $_.Category -eq 'PrivEsc' -and $_.Severity -in 'Critical', 'High' }).Count
+# Filesystem ACL findings are writable binaries and folders, which are escalation paths too.
+$script:Exec.PrivEscCritHigh = @($script:Findings | Where-Object { $_.Category -in 'PrivEsc', 'Filesystem ACL' -and $_.Severity -in 'Critical', 'High' }).Count
 $script:Exec.HardeningGaps = @($script:Findings | Where-Object { $_.Category -eq 'Hardening' -and $_.Severity -in 'Critical', 'High', 'Medium' }).Count
 $script:Exec.SecretsExposed = @($script:Findings | Where-Object { $_.Category -match 'Exposed secret|Credentials' -and $_.Severity -in 'Critical', 'High' }).Count
 $arpFinding = $script:Findings | Where-Object { $_.Title -like '*devices in ARP/neighbor cache*' } | Select-Object -First 1

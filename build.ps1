@@ -9,11 +9,15 @@ if (-not $base) { $base = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
 # Explicit assembly order (reproduces the shipped layout). 04_installedapps and
 # 05_regex are intentionally excluded (dead/orphaned).
+# 31_exec_summary aggregates findings, so it must come after EVERY check section
+# (it used to sit before 32-36, whose findings were then missing from its counts).
+# 37_privesc_paths reads the secedit export taken in 29_os_vulns.
 $order = @(
   '10_header', '11_findings', '12_helpers', '03_adfuncs', '13_secrets',
   '20_system', '21_creds', '22_privesc', '23_network', '24_ad_software',
   '25_ot_discovery', '26_service_inventory', '27_loopback', '28_iis', '29_os_vulns',
-  '30_hardening', '31_exec_summary', '32_history', '33_advanced', '34_btfm_expansion', '35_security_features', '36_inventory', '99_summary'
+  '30_hardening', '32_history', '33_advanced', '34_btfm_expansion', '35_security_features',
+  '37_privesc_paths', '36_inventory', '31_exec_summary', '99_summary'
 )
 
 $sb = New-Object System.Text.StringBuilder

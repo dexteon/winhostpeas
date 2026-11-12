@@ -19,6 +19,15 @@ if ($top) {
 else {
   Write-Host '  No Critical/High findings. ' -ForegroundColor Green
 }
+if ($script:Exec) {
+  Write-Host ''
+  Write-Host 'Executive summary (counted after every section ran):' -ForegroundColor Cyan
+  Write-Host ('  Priv-esc Critical/High:     {0}' -f $script:Exec.PrivEscCritHigh)
+  Write-Host ('  Persistence Critical/High:  {0}' -f $script:Exec.PersistCritHigh)
+  Write-Host ('  Hardening gaps (C/H/M):     {0}' -f $script:Exec.HardeningGaps)
+  Write-Host ('  Exposed secrets (C/H):      {0}' -f $script:Exec.SecretsExposed)
+  Write-Host ('  Local admins:               {0}' -f $script:Exec.AdminCount)
+}
 
 Write-Reports -Dir $OutputDir -LaunchHtml
 
@@ -27,8 +36,6 @@ Write-Reports -Dir $OutputDir -LaunchHtml
 $critHigh = @($script:Findings | Where-Object { $_.Severity -in 'Critical', 'High' }).Count
 $exitCode = [math]::Min($critHigh, 250)
 Write-Host ''
+Write-Host 'WinHostPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
 Write-Host ("Exit code will be {0} (Critical+High count) for unattended triage." -f $exitCode) -ForegroundColor DarkCyan
 exit $exitCode
-
-Write-Host ''
-Write-Host 'WinHostPEAS audit finished. Reports contain no secret values (detection + redaction only).' -ForegroundColor Cyan
