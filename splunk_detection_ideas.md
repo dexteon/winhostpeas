@@ -2,7 +2,7 @@
 
 Sourced from cyberdefense-book corpus: BTFM (auditpol subcategories, event log commands), Practical Network Scanning ch6 (SIEM correlation/alerting/dashboards), hunting-ghosts-fileless-attacks (WMI + scheduled task IOCs), Hexacorn persistence series, fodhelper UAC bypass PoC, PowerShell obfuscation corpus.
 
-These are starting-point SPL queries for a Splunk agent to validate, tune, and productionize against your actual Splunk instance. None are tested against a live indexer — they need field-name verification against your Windows TA / Splunk Add-on for Microsoft Windows.
+These are starting-point SPL queries for a Splunk agent to validate, tune, and productionize against your actual Splunk instance. None are tested against a live indexer, they need field-name verification against your Windows TA / Splunk Add-on for Microsoft Windows.
 
 ---
 
@@ -63,7 +63,7 @@ ObjectName="*WDigest*UseLogonCredential*"
 NewValue="1"
 | table _time, host, ProcessName
 ```
-Alert: someone enabled WDigest — attacker pre-staging for LSASS dump. Severity: High.
+Alert: someone enabled WDigest, attacker pre-staging for LSASS dump. Severity: High.
 
 ### 2b. LSASS access by non-system process
 ```
@@ -73,7 +73,7 @@ ObjectName="*lsass*"
 | where ProcessName NOT IN ("svchost.exe","csrss.exe","wininit.exe","services.exe","smss.exe","MsMpEng.exe","NisSrv.exe")
 | stats count by host, ProcessName, AccessMask
 ```
-Alert: non-system process touching LSASS — potential credential dump. Severity: High. Tune: add your EDR/AV process names.
+Alert: non-system process touching LSASS, potential credential dump. Severity: High. Tune: add your EDR/AV process names.
 
 ### 2c. SAM/SYSTEM hive copy
 ```
@@ -103,7 +103,7 @@ ObjectName="*AMSI*"
 | where NewValue="0" OR NewValue=""
 | table _time, host, ObjectName, ProcessName
 ```
-Alert: AMSI tampering — attacker already on the box. Severity: Critical.
+Alert: AMSI tampering, attacker already on the box. Severity: Critical.
 
 ### 3b. Defender exclusions added
 ```
@@ -167,7 +167,7 @@ index=windows EventCode=4657
 ObjectName="*Image File Execution Options*Debugger*"
 | table _time, host, ObjectName, NewValue, ProcessName
 ```
-Alert: debugger planted on a system binary — code execution primitive. Severity: High.
+Alert: debugger planted on a system binary, code execution primitive. Severity: High.
 
 ---
 
@@ -198,7 +198,7 @@ index=windows EventCode=4624 LogonType=3 AuthenticationPackageName="NTLM"
 | stats count by host, SourceNetworkAddress, Account
 | where count > 10
 ```
-Alert: machine-account NTLM to a share — possible PtH. Severity: Medium. Requires tuning.
+Alert: machine-account NTLM to a share, possible PtH. Severity: Medium. Requires tuning.
 
 ---
 
@@ -265,7 +265,7 @@ index=winhostpeas Title="*No patches*" | stats values(host) as stale_hosts
 ## 7. Alert Action Ideas
 
 - **Auto-isolate:** any Critical WinHostPEAS finding in Persistence or Masquerading category triggers host isolation via firewall GPO
-- **Ticket creation:** any High finding auto-creates ServiceNow/Jira ticket with finding detail + remediation text (WinHostPEAS JSON includes a Remediation field — use it directly)
+- **Ticket creation:** any High finding auto-creates ServiceNow/Jira ticket with finding detail + remediation text (WinHostPEAS JSON includes a Remediation field, use it directly)
 - **Slack/Teams notification:** Critical findings send immediate channel alert with host + finding summary
 - **Golden image gate:** WinHostPEAS exit code > 0 on image build server blocks the build pipeline (CI/CD gate)
 
@@ -293,7 +293,7 @@ index=winhostpeas Title="*No patches*" | stats values(host) as stale_hosts
 ## Notes for the Implementing Agent
 
 1. All SPL queries need field-name verification against your Splunk Windows TA. Common differences: `host` vs `Computer`, `ProcessName` vs `Image`, `ObjectName` vs `RegistryKeyPath`.
-2. Tune exclusion lists per environment — the `NOT IN (...)` filters need your actual admin tool process names.
+2. Tune exclusion lists per environment, the `NOT IN (...)` filters need your actual admin tool process names.
 3. The WinHostPEAS JSON ingestion assumes a Splunk custom source type. Create a JSON source type in `props.conf` for the WinHostPEAS report format.
 4. Correlation searches should use a rolling 24h window for persistence checks (registry modifications are one-time events) and real-time for logon/lateral movement.
-5. The BTFM auditpol subcategory list (15+ subcategories) maps directly to Splunk auditpol data model fields — check if your TA ingests `auditpol /subcategory:*` output.
+5. The BTFM auditpol subcategory list (15+ subcategories) maps directly to Splunk auditpol data model fields, check if your TA ingests `auditpol /subcategory:*` output.
